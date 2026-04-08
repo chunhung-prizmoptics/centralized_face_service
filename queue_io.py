@@ -7,12 +7,16 @@ import time
 import redis
 from loguru import logger
 
+# Pending messages older than this are reclaimed from dead consumers on startup
+_PENDING_CLAIM_IDLE_MS = 60_000  # 60 seconds
+
 
 class RedisStreamReader:
     """
     Reads messages from a Redis Stream using consumer groups (XREADGROUP).
-    Creates the stream and consumer group on first use if they don't exist.
-    Acknowledges processed messages with XACK.
+    - Creates the consumer group starting at $ (new messages only) on first use.
+    - On reconnect, reclaims pending messages idle > 60s from other consumers.
+    - Acknowledges processed messages with XACK.
     """
 
     def __init__(
@@ -23,6 +27,7 @@ class RedisStreamReader:
         consumer: str,
         batch_size: int = 8,
         block_ms: int = 50,
+        request_maxlen: int | None = 1000,
     ):
         self._url = redis_url
         self._stream = stream
@@ -30,6 +35,7 @@ class RedisStreamReader:
         self._consumer = consumer
         self._batch_size = batch_size
         self._block_ms = block_ms
+        self._request_maxlen = request_maxlen
         self._client: redis.Redis | None = None
         self._connect()
 
@@ -44,6 +50,8 @@ class RedisStreamReader:
                 self._client = redis.from_url(self._url, decode_responses=False)
                 self._client.ping()
                 self._ensure_group()
+                self._reclaim_pending()
+                self._trim_request_stream()
                 logger.info(f"RedisStreamReader connected → {self._url} | stream={self._stream}")
                 return
             except Exception as exc:
@@ -53,17 +61,59 @@ class RedisStreamReader:
                 retries += 1
 
     def _ensure_group(self):
-        """Create stream + consumer group if they don't already exist."""
+        """
+        Create consumer group if it doesn't exist, starting at $ so only
+        new messages are delivered — no replay of historical entries on restart.
+        """
         try:
             self._client.xgroup_create(
-                self._stream, self._group, id="0", mkstream=True
+                self._stream, self._group, id="$", mkstream=True
             )
-            logger.info(f"Consumer group '{self._group}' created on stream '{self._stream}'.")
+            logger.info(f"Consumer group '{self._group}' created on stream '{self._stream}' (offset=$).")
         except redis.exceptions.ResponseError as e:
             if "BUSYGROUP" in str(e):
-                pass  # group already exists — fine
+                pass  # group already exists — offset is preserved, no replay
             else:
                 raise
+
+    def _reclaim_pending(self):
+        """
+        Reclaim messages that were delivered to other consumers but never
+        acknowledged (e.g. from a previous crashed worker). Uses XAUTOCLAIM
+        to take ownership of messages idle > _PENDING_CLAIM_IDLE_MS.
+        """
+        try:
+            result = self._client.xautoclaim(
+                self._stream,
+                self._group,
+                self._consumer,
+                min_idle_time=_PENDING_CLAIM_IDLE_MS,
+                start_id="0-0",
+                count=self._batch_size,
+            )
+            # result = (next_start_id, [(msg_id, fields), ...], [deleted_ids])
+            claimed = result[1] if result else []
+            if claimed:
+                logger.info(f"Reclaimed {len(claimed)} pending message(s) from idle consumers.")
+        except redis.exceptions.ResponseError as exc:
+            # XAUTOCLAIM requires Redis 7+; gracefully skip on older versions
+            logger.debug(f"XAUTOCLAIM not available ({exc}). Skipping pending reclaim.")
+        except Exception as exc:
+            logger.warning(f"Pending reclaim failed ({exc}).")
+
+    def _trim_request_stream(self):
+        """
+        Trim the request stream to request_maxlen on connect to evict stale
+        JPEG crops that accumulated while the worker was down.
+        """
+        if not self._request_maxlen:
+            return
+        try:
+            removed = self._client.xtrim(self._stream, maxlen=self._request_maxlen, approximate=True)
+            if removed:
+                logger.info(f"Trimmed {removed} stale entries from '{self._stream}' (maxlen={self._request_maxlen}).")
+        except Exception as exc:
+            logger.warning(f"Request stream trim failed ({exc}).")
 
     # ------------------------------------------------------------------
     # Public API
@@ -71,7 +121,7 @@ class RedisStreamReader:
 
     def read(self) -> list[tuple[bytes, dict]]:
         """
-        Read up to batch_size pending messages.
+        Read up to batch_size new messages (> = undelivered only).
         Returns list of (message_id_bytes, fields_dict) pairs.
         fields_dict values are raw bytes.
         """

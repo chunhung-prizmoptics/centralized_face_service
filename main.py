@@ -1,14 +1,14 @@
 """
 main.py – Entry point for the centralized face inference service.
 
-Loads models once, starts the BatchWorker thread, and blocks until
+Loads models once, starts BatchWorker thread(s), and blocks until
 interrupted (Ctrl+C or SIGTERM).
 
-Usage:
-    python main.py --gallery ../gallery
+Usage (defaults come from config.py — just run):
+    python main.py
 
-Full options:
-    python main.py --help
+Override specific settings:
+    python main.py --workers 2 --batch-size 16
 """
 
 import os
@@ -36,19 +36,22 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Centralized GPU Face Recognition Service"
     )
-    p.add_argument("--gallery",    default=cfg.GALLERY_DIR,   help=f"Gallery directory  [{cfg.GALLERY_DIR}]")
-    p.add_argument("--cache",      default=cfg.CACHE_PATH,    help=f"Embedding cache path  [{cfg.CACHE_PATH}]")
-    p.add_argument("--batch-size", type=int, default=cfg.BATCH_SIZE, help=f"Inference batch size  [{cfg.BATCH_SIZE}]")
-    p.add_argument("--det-size",   type=int, default=cfg.DET_SIZE,   help=f"InsightFace detection size  [{cfg.DET_SIZE}]")
-    p.add_argument("--threshold",  type=float, default=cfg.MATCH_THRESHOLD, help=f"Match cosine threshold  [{cfg.MATCH_THRESHOLD}]")
+    p.add_argument("--gallery",         default=cfg.GALLERY_DIR,      help=f"Gallery directory  [{cfg.GALLERY_DIR}]")
+    p.add_argument("--cache",           default=cfg.CACHE_PATH,       help=f"Embedding cache path  [{cfg.CACHE_PATH}]")
     p.add_argument("--redis-url",       default=cfg.REDIS_URL,        help=f"Redis URL  [{cfg.REDIS_URL}]")
-    p.add_argument("--request-stream",  default=cfg.REQUEST_STREAM,   help=f"Redis input stream name  [{cfg.REQUEST_STREAM}]")
-    p.add_argument("--result-stream",   default=cfg.RESULT_STREAM,    help=f"Redis output stream name  [{cfg.RESULT_STREAM}]")
-    p.add_argument("--consumer-group",  default=cfg.CONSUMER_GROUP,   help=f"Redis consumer group name  [{cfg.CONSUMER_GROUP}]")
-    p.add_argument("--result-maxlen",   type=int, default=cfg.RESULT_MAXLEN, help=f"Max entries kept in result stream (0=unlimited)  [{cfg.RESULT_MAXLEN}]")
-    p.add_argument("--no-reid",    action="store_true",       help="Skip ReID embedding (faster, uses zero vectors)")
-    p.add_argument("--detect",     action="store_true",       help="Run full face detection on each crop (SCRFD + alignment). Default: off — assumes pre-cropped faces, runs landmark alignment + ArcFace directly.")
-    p.add_argument("--gpu-id",     type=int, default=cfg.GPU_ID, help=f"GPU device ID  [{cfg.GPU_ID}]")
+    p.add_argument("--request-stream",  default=cfg.REQUEST_STREAM,   help=f"Redis input stream  [{cfg.REQUEST_STREAM}]")
+    p.add_argument("--result-stream",   default=cfg.RESULT_STREAM,    help=f"Redis output stream  [{cfg.RESULT_STREAM}]")
+    p.add_argument("--consumer-group",  default=cfg.CONSUMER_GROUP,   help=f"Redis consumer group  [{cfg.CONSUMER_GROUP}]")
+    p.add_argument("--batch-size",      type=int,   default=cfg.BATCH_SIZE,       help=f"Inference batch size  [{cfg.BATCH_SIZE}]")
+    p.add_argument("--workers",         type=int,   default=cfg.WORKERS,          help=f"Parallel BatchWorker threads  [{cfg.WORKERS}]")
+    p.add_argument("--decode-workers",  type=int,   default=cfg.DECODE_WORKERS,   help=f"CPU decode threads per worker  [{cfg.DECODE_WORKERS}]")
+    p.add_argument("--result-maxlen",   type=int,   default=cfg.RESULT_MAXLEN,    help=f"Max result stream entries (0=unlimited)  [{cfg.RESULT_MAXLEN}]")
+    p.add_argument("--request-maxlen",  type=int,   default=cfg.REQUEST_MAXLEN,   help=f"Max request stream entries (0=unlimited)  [{cfg.REQUEST_MAXLEN}]")
+    p.add_argument("--threshold",       type=float, default=cfg.MATCH_THRESHOLD,  help=f"Match cosine threshold  [{cfg.MATCH_THRESHOLD}]")
+    p.add_argument("--det-size",        type=int,   default=cfg.DET_SIZE,         help=f"InsightFace detection size  [{cfg.DET_SIZE}]")
+    p.add_argument("--gpu-id",          type=int,   default=cfg.GPU_ID,           help=f"GPU device ID  [{cfg.GPU_ID}]")
+    p.add_argument("--no-reid",         action="store_true", default=cfg.NO_REID, help="Skip ReID embedding")
+    p.add_argument("--detect",          action="store_true", default=cfg.RUN_DETECTION, help="Run full SCRFD detection on each crop")
     return p.parse_args()
 
 
@@ -75,7 +78,7 @@ def load_insightface(det_size: int, gpu_id: int):
 
 def load_reid(gpu_id: int, no_reid: bool):
     if no_reid:
-        logger.info("ReID skipped (--no-reid).")
+        logger.info("ReID skipped.")
         return None
     from reid_model import ReIDModel
     return ReIDModel(gpu_id=gpu_id)
@@ -104,68 +107,74 @@ def main():
     logger.info("=" * 60)
     logger.info("  Centralized GPU Face Recognition Service")
     logger.info("=" * 60)
-    logger.info(f"  Redis URL   : {args.redis_url}")
-    logger.info(f"  Req stream  : {args.request_stream}")
-    logger.info(f"  Res stream  : {args.result_stream}")
-    logger.info(f"  Gallery     : {args.gallery}")
-    logger.info(f"  Batch size  : {args.batch_size}")
-    logger.info(f"  Threshold   : {args.threshold}")
-    logger.info(f"  GPU ID      : {args.gpu_id}")
-    logger.info(f"  ReID        : {'disabled' if args.no_reid else 'enabled'}")
-    logger.info(f"  Detection   : {'enabled (full SCRFD pipeline)' if args.detect else 'disabled (pre-crop direct ArcFace)'}")
+    logger.info(f"  Redis URL    : {args.redis_url}")
+    logger.info(f"  Req stream   : {args.request_stream}")
+    logger.info(f"  Res stream   : {args.result_stream}")
+    logger.info(f"  Gallery      : {args.gallery}")
+    logger.info(f"  Batch size   : {args.batch_size}")
+    logger.info(f"  Workers      : {args.workers}  (decode threads/worker: {args.decode_workers})")
+    logger.info(f"  Threshold    : {args.threshold}")
+    logger.info(f"  GPU ID       : {args.gpu_id}")
+    logger.info(f"  ReID         : {'disabled' if args.no_reid else 'enabled'}")
+    logger.info(f"  Detection    : {'enabled (SCRFD)' if args.detect else 'disabled (landmark align)'}")
     logger.info("=" * 60)
 
-    # 1. Load InsightFace
+    # 1. Load models (shared across all workers)
     face_app   = load_insightface(args.det_size, args.gpu_id)
     model_lock = threading.Lock()
-
-    # 2. Build face database
-    face_db = build_face_db(args.gallery, args.cache, face_app)
-
-    # 3. Load ReID model
+    face_db    = build_face_db(args.gallery, args.cache, face_app)
     reid_model = load_reid(args.gpu_id, args.no_reid)
 
-    # 4. Create Redis I/O
+    # 2. Create Redis writer (shared)
     from queue_io import RedisStreamReader, RedisStreamWriter
-    reader = RedisStreamReader(
-        redis_url=args.redis_url,
-        stream=args.request_stream,
-        group=args.consumer_group,
-        consumer=cfg.CONSUMER_NAME,
-        batch_size=args.batch_size,
-        block_ms=cfg.BATCH_TIMEOUT_MS,
-    )
     writer = RedisStreamWriter(
         redis_url=args.redis_url,
         stream=args.result_stream,
         maxlen=args.result_maxlen if args.result_maxlen > 0 else None,
     )
 
-    # 5. Start BatchWorker
+    # 3. Start N workers — each gets its own reader with a unique consumer name
     from inference_worker import BatchWorker
-    worker = BatchWorker(
-        reader=reader,
-        writer=writer,
-        face_app=face_app,
-        face_db=face_db,
-        model_lock=model_lock,
-        reid_model=reid_model,
-        threshold=args.threshold,
-        batch_size=args.batch_size,
-        batch_timeout_ms=cfg.BATCH_TIMEOUT_MS,
-        no_reid=args.no_reid,
-        run_detection=args.detect,
-    )
-    worker.start()
-    logger.info("Service running. Press Ctrl+C to stop.")
+    workers = []
+    for i in range(args.workers):
+        reader = RedisStreamReader(
+            redis_url=args.redis_url,
+            stream=args.request_stream,
+            group=args.consumer_group,
+            consumer=f"worker_{i}",
+            batch_size=args.batch_size,
+            block_ms=cfg.BATCH_TIMEOUT_MS,
+            request_maxlen=args.request_maxlen if (i == 0 and args.request_maxlen > 0) else None,
+        )
+        w = BatchWorker(
+            reader=reader,
+            writer=writer,
+            face_app=face_app,
+            face_db=face_db,
+            model_lock=model_lock,
+            reid_model=reid_model,
+            threshold=args.threshold,
+            batch_size=args.batch_size,
+            batch_timeout_ms=cfg.BATCH_TIMEOUT_MS,
+            no_reid=args.no_reid,
+            run_detection=args.detect,
+            decode_workers=args.decode_workers,
+        )
+        w.name = f"BatchWorker-{i}"
+        w.start()
+        workers.append(w)
+        logger.info(f"BatchWorker-{i} started.")
 
-    # 6. Block — handle Ctrl+C / SIGTERM
+    logger.info(f"Service running ({args.workers} worker(s)). Press Ctrl+C to stop.")
+
+    # 4. Block — handle Ctrl+C / SIGTERM
     stop_event = threading.Event()
 
     def _shutdown(signum, frame):
         logger.info(f"Signal {signum} received. Shutting down…")
         stop_event.set()
-        worker.stop()
+        for w in workers:
+            w.stop()
 
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -176,7 +185,8 @@ def main():
     except KeyboardInterrupt:
         _shutdown(signal.SIGINT, None)
 
-    worker.join(timeout=10)
+    for w in workers:
+        w.join(timeout=10)
     logger.info("Shutdown complete.")
 
 

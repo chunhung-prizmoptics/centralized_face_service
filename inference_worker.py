@@ -8,10 +8,12 @@ InsightFace + ReID GPU inference, then publishes results back to Redis.
 import json
 import threading
 import time
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+from insightface.utils import face_align
 from loguru import logger
 
 import config
@@ -19,17 +21,27 @@ from face_db import FaceDatabase
 from queue_io import RedisStreamReader, RedisStreamWriter
 from reid_model import ReIDModel
 
+# 3D reference face model for 5-point landmark pose estimation (solvePnP).
+# Points: left_eye, right_eye, nose_tip, left_mouth, right_mouth.
+# Coordinates in mm from a generic 3D face model (Dlib/OpenFace convention).
+_FACE_3D_MODEL = np.array([
+    [-165.0,  170.0, -135.0],  # left eye
+    [ 165.0,  170.0, -135.0],  # right eye
+    [   0.0,    0.0,    0.0],  # nose tip
+    [-150.0, -150.0, -125.0],  # left mouth
+    [ 150.0, -150.0, -125.0],  # right mouth
+], dtype=np.float32)
+
 
 class BatchWorker(threading.Thread):
     """
     Continuously:
       1. Collects up to BATCH_SIZE messages from Redis within BATCH_TIMEOUT_MS.
-      2. Decodes JPEG → numpy (corrupt JPEG → error result).
-      3. Runs InsightFace on each image:
-           - `face_app.get(img)` first (detection + recognition).
-           - If no face detected, falls back to direct recognition model call.
-      4. Runs ReID on each image (returns zeros if ReID unavailable).
-      5. Publishes results to the result stream.
+      2. Drops messages past their deadline_ts_ms (stale frames).
+      3. Decodes JPEG → numpy in parallel (ThreadPoolExecutor).
+      4. Runs batched ArcFace GPU inference in one call.
+      5. Runs ReID on each image (returns zeros if ReID unavailable).
+      6. Publishes results to the result stream.
     """
 
     def __init__(
@@ -45,6 +57,7 @@ class BatchWorker(threading.Thread):
         batch_timeout_ms: int = config.BATCH_TIMEOUT_MS,
         no_reid: bool = False,
         run_detection: bool = False,
+        decode_workers: int = 4,
     ):
         super().__init__(daemon=True)
         self._reader = reader
@@ -59,6 +72,7 @@ class BatchWorker(threading.Thread):
         self._no_reid = no_reid
         self._run_detection = run_detection
         self._stop_event = threading.Event()
+        self._decode_pool = ThreadPoolExecutor(max_workers=decode_workers, thread_name_prefix="decode")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -70,9 +84,7 @@ class BatchWorker(threading.Thread):
             buf = np.frombuffer(data, dtype=np.uint8)
             img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
             if img is None or img.size == 0:
-                logger.debug(f"_decode_jpeg: cv2.imdecode returned None/empty for {len(data)} bytes")
                 return None
-            logger.debug(f"_decode_jpeg: OK → shape={img.shape}")
             return img
         except Exception as exc:
             logger.debug(f"_decode_jpeg: exception — {exc}")
@@ -83,31 +95,136 @@ class BatchWorker(threading.Thread):
         raw = fields.get(b"face_crop_jpeg") or fields.get("face_crop_jpeg")
 
         if raw is None:
-            logger.warning("_decode_crop: field 'face_crop_jpeg' is missing entirely. "
-                           f"Available keys: {[k if isinstance(k, str) else k.decode(errors='replace') for k in fields.keys()]}")
+            logger.warning("_decode_crop: field 'face_crop_jpeg' missing. "
+                           f"Keys: {[k if isinstance(k, str) else k.decode(errors='replace') for k in fields.keys()]}")
             return None
 
-        if isinstance(raw, str):
-            logger.warning("_decode_crop: payload is str, not bytes — "
-                           "Redis connection may have decode_responses=True. Converting via latin-1.")
-            raw = raw.encode("latin-1")
-
-        if len(raw) == 0:
-            logger.warning("_decode_crop: payload is empty (0 bytes).")
+        if isinstance(raw, (bytes, bytearray)) and len(raw) >= 2 and raw[:2] != b"\xff\xd8":
+            logger.warning(f"_decode_crop: invalid JPEG header {raw[:4].hex()} — check field encoding.")
             return None
-
-        head = raw[:4].hex()
-        tail = raw[-2:].hex()
-        logger.debug(f"_decode_crop: len={len(raw)} head={head} tail={tail}")
-
-        if not raw[:2] == b"\xff\xd8":
-            logger.warning(f"_decode_crop: not a valid JPEG — expected header ffd8, got {head}. "
-                           "Possible cause: base64 still being sent, truncation, or wrong field.")
-            return None
-        if not raw[-2:] == b"\xff\xd9":
-            logger.warning(f"_decode_crop: JPEG footer missing (got {tail}) — payload may be truncated.")
 
         return self._decode_jpeg(raw)
+
+    def _parse_landmarks(self, fields: dict, img: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Parse landmark_5_xy from a message field.
+
+        Format accepted (tried in order):
+          1. JSON  — b'[[x0,y0],[x1,y1],...]'
+          2. CSV   — b'x0,y0,x1,y1,x2,y2,x3,y3,x4,y4'
+
+        Coordinates must be **normalized [0..1] within the face crop**.
+        They are scaled to absolute pixel coords using the crop dimensions.
+
+        Returns a (5, 2) float32 array in absolute pixels, or None.
+        """
+        raw = fields.get(b"landmark_5_xy") or fields.get("landmark_5_xy")
+        if not raw:
+            return None
+
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode(errors="replace")
+
+        h, w = img.shape[:2]
+        kps = None
+
+        # --- Try JSON first ---
+        try:
+            kps = np.array(json.loads(raw), dtype=np.float32).reshape(5, 2)
+        except Exception:
+            pass
+
+        # --- Fallback: CSV (10 comma-separated floats) ---
+        if kps is None:
+            try:
+                vals = [float(v.strip()) for v in raw.split(",")]
+                if len(vals) == 10:
+                    kps = np.array(vals, dtype=np.float32).reshape(5, 2)
+            except Exception:
+                pass
+
+        if kps is None:
+            logger.warning(f"_parse_landmarks: could not parse landmark_5_xy: {raw!r}")
+            return None
+
+        # Scale normalized [0..1] → absolute pixel coords
+        kps[:, 0] *= w
+        kps[:, 1] *= h
+        logger.debug(f"_parse_landmarks: parsed and scaled to {w}×{h} — kps={kps.tolist()}")
+        return kps
+
+    def _align_crop(self, img: np.ndarray, fields: dict) -> np.ndarray:
+        """
+        Align a decoded face crop to 112×112 for ArcFace.
+
+        Uses norm_crop with landmarks when available (JSON or CSV, normalized [0..1]).
+        Falls back to plain resize when landmarks are absent or unparseable.
+
+        Expected landmark order (RetinaFace standard):
+          [left_eye, right_eye, nose_tip, left_mouth, right_mouth]
+        """
+        kps = self._parse_landmarks(fields, img)
+        if kps is not None:
+            logger.debug("_align_crop: using landmark_5_xy for norm_crop")
+            return face_align.norm_crop(img, landmark=kps)
+
+        logger.debug("_align_crop: no landmark_5_xy — using plain resize to 112×112")
+        return cv2.resize(img, (112, 112))
+
+    def _estimate_pose(self, fields: dict, img: np.ndarray) -> Tuple[float, float, float]:
+        """
+        Estimate head pose (yaw, pitch, roll) in degrees from the 5 RetinaFace
+        landmarks sent by the producer.  Uses solvePnP with a generic 3D face model.
+
+        Returns (yaw, pitch, roll) or (0.0, 0.0, 0.0) if landmarks are unavailable.
+
+        Sign convention (right-hand rule):
+          yaw   > 0 → face turned right
+          pitch > 0 → face tilted up
+          roll  > 0 → face rolled counter-clockwise
+        """
+        kps = self._parse_landmarks(fields, img)
+        if kps is None:
+            return 0.0, 0.0, 0.0
+        try:
+            h, w = img.shape[:2]
+            focal = w  # rough approximation: focal ≈ image width
+            cam_matrix = np.array([
+                [focal, 0,     w / 2],
+                [0,     focal, h / 2],
+                [0,     0,     1    ],
+            ], dtype=np.float32)
+            dist_coeffs = np.zeros((4, 1), dtype=np.float32)
+
+            _, rvec, _ = cv2.solvePnP(
+                _FACE_3D_MODEL, kps, cam_matrix, dist_coeffs,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            rmat, _ = cv2.Rodrigues(rvec)
+            sy = np.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2)
+            singular = sy < 1e-6
+            if not singular:
+                pitch = float(np.degrees(np.arctan2(-rmat[2, 0], sy)))
+                yaw   = float(np.degrees(np.arctan2( rmat[2, 1], rmat[2, 2])))
+                roll  = float(np.degrees(np.arctan2( rmat[1, 0], rmat[0, 0])))
+            else:
+                pitch = float(np.degrees(np.arctan2(-rmat[2, 0], sy)))
+                yaw   = 0.0
+                roll  = float(np.degrees(np.arctan2(-rmat[1, 2], rmat[1, 1])))
+            return round(yaw, 2), round(pitch, 2), round(roll, 2)
+        except Exception as exc:
+            logger.debug(f"_estimate_pose failed: {exc}")
+            return 0.0, 0.0, 0.0
+
+    @staticmethod
+    def _estimate_quality(img: np.ndarray) -> float:
+        """
+        Estimate face image quality as a Laplacian variance score (blur detection).
+        Higher = sharper.  Normalized to [0, 1] with soft saturation at 500.
+        """
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        return round(min(lap_var / 500.0, 1.0), 4)
 
     def _get_embedding_insightface(self, img: np.ndarray):
         """
@@ -196,15 +313,34 @@ class BatchWorker(threading.Thread):
         if not messages:
             return
 
-        msg_ids = [msg_id for msg_id, _ in messages]
-        fields_list = [fields for _, fields in messages]
+        now_ms = int(time.time() * 1000)
+        live, stale_ids = [], []
+        for msg_id, fields in messages:
+            deadline_raw = fields.get(b"deadline_ts_ms") or fields.get("deadline_ts_ms")
+            if deadline_raw:
+                try:
+                    deadline = int(deadline_raw)
+                    if deadline < now_ms:
+                        stale_ids.append(msg_id)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            live.append((msg_id, fields))
+
+        if stale_ids:
+            logger.debug(f"Dropped {len(stale_ids)} stale message(s) past deadline.")
+            self._reader.ack(stale_ids)
+
+        if not live:
+            return
+
+        msg_ids = [msg_id for msg_id, _ in live]
+        fields_list = [fields for _, fields in live]
 
         if self._run_detection:
-            # Detection path: InsightFace public API is single-image only
             for fields in fields_list:
                 self._process_single_detect(fields)
         else:
-            # Direct path: batch all crops into one GPU call
             self._process_batch_direct(fields_list)
 
         self._reader.ack(msg_ids)
@@ -221,27 +357,17 @@ class BatchWorker(threading.Thread):
                 self._publish_error(fields, "no_recognition_model")
             return
 
-        # --- Stage 1: decode + resize (CPU, parallelisable) ---
-        decoded = []  # list of (fields, img_112) or (fields, None)
-        for fields in fields_list:
+        # --- Stage 1: parallel decode + align (CPU) ---
+        def _decode_one(fields):
             img = self._decode_crop(fields)
             if img is None:
                 event_id = fields.get(b"event_id", b"").decode(errors="replace")
                 logger.warning(f"[{event_id}] JPEG decode failed.")
                 self._publish_error(fields, "decode_failed")
-                decoded.append((fields, None))
-            else:
-                # DEBUG: save raw decoded image for visual inspection (first 5 only)
-                import os, tempfile
-                _debug_dir = os.path.join(tempfile.gettempdir(), "face_debug")
-                os.makedirs(_debug_dir, exist_ok=True)
-                existing = len(os.listdir(_debug_dir))
-                if existing < 5:
-                    event_id = fields.get(b"event_id", b"").decode(errors="replace")
-                    debug_path = os.path.join(_debug_dir, f"{existing:03d}_{event_id[:40]}.jpg")
-                    cv2.imwrite(debug_path, img)
-                    logger.info(f"DEBUG saved crop → {debug_path}  shape={img.shape}")
-                decoded.append((fields, cv2.resize(img, (112, 112))))
+                return fields, None
+            return fields, self._align_crop(img, fields)
+
+        decoded = list(self._decode_pool.map(_decode_one, fields_list))
 
         valid = [(fields, crop) for fields, crop in decoded if crop is not None]
         if not valid:
@@ -249,17 +375,11 @@ class BatchWorker(threading.Thread):
 
         # --- Stage 2: single batched GPU call ---
         # get_feat expects a list of (112,112,3) images, NOT a stacked (N,112,112,3) array.
-        # Passing a numpy array causes cv2.dnn.blobFromImages to treat the whole
-        # batch as a single malformed image and crash on resize.
         crops_list = [crop for _, crop in valid]
-        batch_arr = np.stack(crops_list, axis=0)  # kept only for the debug log
-        logger.debug(f"_process_batch_direct: batch_arr shape={batch_arr.shape} dtype={batch_arr.dtype}")
         try:
-            logger.debug("_process_batch_direct: calling rec_model.get_feat…")
             with self._model_lock:
                 embeddings = rec_model.get_feat(crops_list)  # (N, 512)
             embeddings = np.array(embeddings)
-            logger.debug(f"_process_batch_direct: embeddings shape={embeddings.shape} norms={np.linalg.norm(embeddings, axis=1).round(3).tolist()}")
         except Exception as exc:
             logger.exception(f"_process_batch_direct: rec_model.get_feat failed — {exc}")
             for fields, _ in valid:
