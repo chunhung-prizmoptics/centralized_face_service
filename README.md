@@ -154,17 +154,21 @@ All field values are raw bytes (not base64, not JSON-encoded strings).
 
 Stream: `face_inference:results`
 
-| Field            | Type   | Description                                             |
-|------------------|--------|---------------------------------------------------------|
-| `event_id`       | string | Echoed from the request                                 |
-| `camera_id`      | string | Echoed from the request                                 |
-| `track_id`       | string | Echoed from the request                                 |
-| `timestamp`      | string | Echoed from the request                                 |
-| `identity`       | string | Matched identity name, or `"Unknown"`                   |
-| `identity_id`    | string | UUID of the matched identity (empty if Unknown)         |
-| `confidence`     | string | Cosine similarity score (float, 0–1)                    |
-| `embedding`      | JSON   | 512-D ArcFace embedding as a JSON float array           |
-| `reid_embedding` | JSON   | 256-D ReID embedding (empty array if `--no-reid`)       |
+| Field            | Type   | Description                                                                 |
+|------------------|--------|-----------------------------------------------------------------------------|
+| `event_id`       | string | Echoed from the request                                                     |
+| `camera_id`      | string | Echoed from the request                                                     |
+| `track_id`       | string | Echoed from the request                                                     |
+| `timestamp`      | string | Echoed from the request                                                     |
+| `identity`       | string | Matched identity name, or `"Unknown"`                                       |
+| `identity_id`    | string | UUID of the matched identity (empty string if Unknown)                      |
+| `confidence`     | string | Cosine similarity score (float, 0–1)                                        |
+| `yaw`            | string | Head yaw in degrees (positive = face turned right). `0.0` if no landmarks. |
+| `pitch`          | string | Head pitch in degrees (positive = face tilted up). `0.0` if no landmarks.  |
+| `roll`           | string | Head roll in degrees (positive = face tilted clockwise). `0.0` if no landmarks. |
+| `quality`        | string | Sharpness score (float, 0–1). Laplacian variance, saturates at 500. `1.0` = very sharp. |
+| `embedding`      | JSON   | 512-D ArcFace embedding as a JSON float array                               |
+| `reid_embedding` | JSON   | 256-D ReID embedding (all-zeros if `--no-reid`)                             |
 
 ---
 

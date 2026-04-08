@@ -52,6 +52,21 @@ class RedisStreamReader:
                 self._ensure_group()
                 self._reclaim_pending()
                 self._trim_request_stream()
+                # Log stream info to help diagnose empty-stream problems
+                try:
+                    info = self._client.xinfo_stream(self._stream)
+                    length = info.get(b"length", info.get("length", "?"))
+                    logger.info(f"Stream '{self._stream}' has {length} entries.")
+                    ginfo = self._client.xinfo_groups(self._stream)
+                    for g in ginfo:
+                        gname = g.get(b"name", g.get("name", b"?"))
+                        if isinstance(gname, bytes):
+                            gname = gname.decode()
+                        pending = g.get(b"pending", g.get("pending", "?"))
+                        lag = g.get(b"lag", g.get("lag", "?"))
+                        logger.info(f"  Group '{gname}': pending={pending} lag={lag}")
+                except Exception as e:
+                    logger.debug(f"xinfo not available: {e}")
                 logger.info(f"RedisStreamReader connected → {self._url} | stream={self._stream}")
                 return
             except Exception as exc:
@@ -138,6 +153,7 @@ class RedisStreamReader:
                     return []
                 # raw = [(stream_name, [(msg_id, {field: value}), ...])]
                 _, messages = raw[0]
+                logger.debug(f"[{self._consumer}] xreadgroup → {len(messages)} message(s)")
                 return messages
             except redis.exceptions.ConnectionError as exc:
                 logger.warning(f"Redis read error ({exc}). Reconnecting…")

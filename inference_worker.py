@@ -58,6 +58,7 @@ class BatchWorker(threading.Thread):
         no_reid: bool = False,
         run_detection: bool = False,
         decode_workers: int = 4,
+        deadline_grace_ms: int = config.DEADLINE_GRACE_MS,
     ):
         super().__init__(daemon=True)
         self._reader = reader
@@ -73,6 +74,7 @@ class BatchWorker(threading.Thread):
         self._run_detection = run_detection
         self._stop_event = threading.Event()
         self._decode_pool = ThreadPoolExecutor(max_workers=decode_workers, thread_name_prefix="decode")
+        self._deadline_grace_ms = deadline_grace_ms  # 0 = deadline filtering disabled
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -198,7 +200,7 @@ class BatchWorker(threading.Thread):
 
             _, rvec, _ = cv2.solvePnP(
                 _FACE_3D_MODEL, kps, cam_matrix, dist_coeffs,
-                flags=cv2.SOLVEPNP_ITERATIVE,
+                flags=cv2.SOLVEPNP_EPNP,
             )
             rmat, _ = cv2.Rodrigues(rvec)
             sy = np.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2)
@@ -316,15 +318,16 @@ class BatchWorker(threading.Thread):
         now_ms = int(time.time() * 1000)
         live, stale_ids = [], []
         for msg_id, fields in messages:
-            deadline_raw = fields.get(b"deadline_ts_ms") or fields.get("deadline_ts_ms")
-            if deadline_raw:
-                try:
-                    deadline = int(deadline_raw)
-                    if deadline < now_ms:
-                        stale_ids.append(msg_id)
-                        continue
-                except (ValueError, TypeError):
-                    pass
+            if self._deadline_grace_ms > 0:
+                deadline_raw = fields.get(b"deadline_ts_ms") or fields.get("deadline_ts_ms")
+                if deadline_raw:
+                    try:
+                        deadline = int(deadline_raw)
+                        if deadline + self._deadline_grace_ms < now_ms:
+                            stale_ids.append(msg_id)
+                            continue
+                    except (ValueError, TypeError):
+                        pass
             live.append((msg_id, fields))
 
         if stale_ids:
@@ -392,7 +395,7 @@ class BatchWorker(threading.Thread):
             if np.linalg.norm(emb) < 1e-3:
                 self._publish_error(fields, "no_face_detected")
                 continue
-            self._publish_result(fields, emb, crop if not self._no_reid else None)
+            self._publish_result(fields, emb, crop, crop if not self._no_reid else None)
 
     def _process_single_detect(self, fields: dict):
         """
@@ -419,9 +422,9 @@ class BatchWorker(threading.Thread):
             self._publish_error(fields, "no_face_detected")
             return
 
-        self._publish_result(fields, embedding, img if not self._no_reid else None)
+        self._publish_result(fields, embedding, img, img if not self._no_reid else None)
 
-    def _publish_result(self, fields: dict, embedding: np.ndarray, img_for_reid):
+    def _publish_result(self, fields: dict, embedding: np.ndarray, crop: np.ndarray, img_for_reid):
         """Match embedding, run ReID if needed, publish to result stream."""
         event_id = fields.get(b"event_id", b"").decode(errors="replace")
 
@@ -439,6 +442,16 @@ class BatchWorker(threading.Thread):
         else:
             reid_emb = np.zeros(256, dtype=np.float32)
 
+        # Pose and quality — best-effort, never block publish on failure
+        try:
+            yaw, pitch, roll = self._estimate_pose(fields, crop)
+        except Exception:
+            yaw, pitch, roll = 0.0, 0.0, 0.0
+        try:
+            quality = self._estimate_quality(crop)
+        except Exception:
+            quality = 0.0
+
         result = {
             b"event_id":       fields.get(b"event_id", b""),
             b"camera_id":      fields.get(b"camera_id",  b""),
@@ -447,6 +460,10 @@ class BatchWorker(threading.Thread):
             b"identity":       identity.encode(),
             b"identity_id":    identity_id.encode(),
             b"confidence":     str(round(float(confidence), 6)).encode(),
+            b"yaw":            str(round(yaw,   2)).encode(),
+            b"pitch":          str(round(pitch, 2)).encode(),
+            b"roll":           str(round(roll,  2)).encode(),
+            b"quality":        str(round(quality, 4)).encode(),
             b"embedding":      json.dumps(embedding.tolist()).encode(),
             b"reid_embedding": json.dumps(reid_emb.tolist()).encode(),
         }

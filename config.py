@@ -11,7 +11,7 @@ import os
 # Redis
 # -----------------------------------------------------------------------
 REDIS_URL       = os.getenv("REDIS_URL",        "redis://localhost:6379")
-REQUEST_STREAM  = os.getenv("REQUEST_STREAM",   "vision:track_events")
+REQUEST_STREAM  = os.getenv("REQUEST_STREAM",   "face_inference:requests")
 RESULT_STREAM   = os.getenv("RESULT_STREAM",    "face_inference:results")
 CONSUMER_GROUP  = os.getenv("CONSUMER_GROUP",   "face_inference_workers")
 CONSUMER_NAME   = os.getenv("CONSUMER_NAME",    "worker_0")
@@ -55,3 +55,11 @@ RUN_DETECTION = os.getenv("RUN_DETECTION", "0") == "1"
 # Features
 # -----------------------------------------------------------------------
 NO_REID = os.getenv("NO_REID", "1") == "1"   # set "0" to enable ReID embeddings
+
+# -----------------------------------------------------------------------
+# Deadline filtering
+# -----------------------------------------------------------------------
+# Maximum age (ms) past deadline_ts_ms before a message is dropped.
+# Set to 0 to disable deadline filtering entirely.
+# This must be large enough to cover clock skew between producer and worker.
+DEADLINE_GRACE_MS = int(os.getenv("DEADLINE_GRACE_MS", "0"))  # 0 = disabled
