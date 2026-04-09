@@ -236,5 +236,5 @@ curl http://localhost:8000/health
 ### Check Redis
 
 ```
-docker exec fusion-redis redis-cli --raw XINFO STREAM face_inference:results FULL COUNT 1  
+docker exec fusion-redis redis-cli --raw XREVRANGE face_inference:results + - COUNT 1
 ```
