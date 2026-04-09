@@ -27,8 +27,8 @@ DECODE_WORKERS   = int(os.getenv("DECODE_WORKERS",   "4"))    # CPU threads for 
 # -----------------------------------------------------------------------
 # Stream size limits
 # -----------------------------------------------------------------------
-RESULT_MAXLEN   = int(os.getenv("RESULT_MAXLEN",  "10000"))  # max entries in result stream
-REQUEST_MAXLEN  = int(os.getenv("REQUEST_MAXLEN", "1000"))   # max JPEG crops kept in request stream
+RESULT_MAXLEN   = int(os.getenv("RESULT_MAXLEN",  "100000"))  # max entries in result stream (no embeddings → small msgs)
+REQUEST_MAXLEN  = int(os.getenv("REQUEST_MAXLEN", "1000"))    # max JPEG crops kept in request stream
 
 # -----------------------------------------------------------------------
 # Matching

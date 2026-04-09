@@ -76,6 +76,12 @@ class BatchWorker(threading.Thread):
         self._decode_pool = ThreadPoolExecutor(max_workers=decode_workers, thread_name_prefix="decode")
         self._deadline_grace_ms = deadline_grace_ms  # 0 = deadline filtering disabled
 
+        # Throughput stats
+        self._stats_lock = threading.Lock()
+        self._stats_frames   = 0   # frames processed since last report
+        self._stats_batches  = 0
+        self._stats_last_ts  = time.monotonic()
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -152,7 +158,6 @@ class BatchWorker(threading.Thread):
         # Scale normalized [0..1] → absolute pixel coords
         kps[:, 0] *= w
         kps[:, 1] *= h
-        logger.debug(f"_parse_landmarks: parsed and scaled to {w}×{h} — kps={kps.tolist()}")
         return kps
 
     def _align_crop(self, img: np.ndarray, fields: dict) -> np.ndarray:
@@ -167,10 +172,7 @@ class BatchWorker(threading.Thread):
         """
         kps = self._parse_landmarks(fields, img)
         if kps is not None:
-            logger.debug("_align_crop: using landmark_5_xy for norm_crop")
             return face_align.norm_crop(img, landmark=kps)
-
-        logger.debug("_align_crop: no landmark_5_xy — using plain resize to 112×112")
         return cv2.resize(img, (112, 112))
 
     def _estimate_pose(self, fields: dict, img: np.ndarray) -> Tuple[float, float, float]:
@@ -290,8 +292,8 @@ class BatchWorker(threading.Thread):
             b"timestamp":     fields.get(b"timestamp",  b""),
             b"identity":      b"error",
             b"confidence":    b"0.0",
-            b"embedding":     b"",
-            b"reid_embedding":b"",
+            # b"embedding":     b"",
+            # b"reid_embedding":b"",
             b"error_message": reason.encode(),
         }
         self._writer.write(result)
@@ -301,14 +303,56 @@ class BatchWorker(threading.Thread):
     # ------------------------------------------------------------------
 
     def run(self):
-        logger.info("BatchWorker started.")
+        logger.info(f"[{self.name}] BatchWorker started.")
+        _STATS_INTERVAL = 5.0  # seconds between throughput reports
+        _next_report = time.monotonic() + _STATS_INTERVAL
         while not self._stop_event.is_set():
             try:
                 self._process_batch()
             except Exception as exc:
                 logger.exception(f"BatchWorker unexpected error: {exc}")
                 time.sleep(0.1)
-        logger.info("BatchWorker stopped.")
+            if time.monotonic() >= _next_report:
+                self._report_stats()
+                _next_report = time.monotonic() + _STATS_INTERVAL
+        logger.info(f"[{self.name}] BatchWorker stopped.")
+
+    def _report_stats(self):
+        now = time.monotonic()
+        with self._stats_lock:
+            frames  = self._stats_frames
+            batches = self._stats_batches
+            elapsed = now - self._stats_last_ts
+            self._stats_frames  = 0
+            self._stats_batches = 0
+            self._stats_last_ts = now
+
+        fps = frames / elapsed if elapsed > 0 else 0.0
+
+        # Request stream lag = how many messages are queued but not yet delivered to this group
+        req_lag = "?"
+        result_len = "?"
+        try:
+            client = self._reader._client
+            groups = client.xinfo_groups(self._reader._stream)
+            for g in groups:
+                gname = g.get(b"name", g.get("name", b""))
+                if isinstance(gname, bytes):
+                    gname = gname.decode()
+                if gname == self._reader._group:
+                    req_lag = g.get(b"lag", g.get("lag", "?"))
+                    break
+        except Exception:
+            pass
+        try:
+            result_len = self._writer._client.xlen(self._writer._stream)
+        except Exception:
+            pass
+
+        logger.info(
+            f"[{self.name}] Stats | {fps:.1f} fps  {frames} frames  "
+            f"{batches} batches  req_queue={req_lag}  result_stream_len={result_len}"
+        )
 
     def _process_batch(self):
         messages = self._reader.read()
@@ -347,6 +391,8 @@ class BatchWorker(threading.Thread):
             self._process_batch_direct(fields_list)
 
         self._reader.ack(msg_ids)
+        with self._stats_lock:
+            self._stats_batches += 1
 
     def _process_batch_direct(self, fields_list: list):
         """
@@ -464,11 +510,12 @@ class BatchWorker(threading.Thread):
             b"pitch":          str(round(pitch, 2)).encode(),
             b"roll":           str(round(roll,  2)).encode(),
             b"quality":        str(round(quality, 4)).encode(),
-            b"embedding":      json.dumps(embedding.tolist()).encode(),
-            b"reid_embedding": json.dumps(reid_emb.tolist()).encode(),
+            # b"embedding":      json.dumps(embedding.tolist()).encode(),
+            # b"reid_embedding": json.dumps(reid_emb.tolist()).encode(),
         }
         self._writer.write(result)
-        logger.debug(f"[{event_id}] → identity={identity} conf={confidence:.3f}")
+        with self._stats_lock:
+            self._stats_frames += 1
 
     # ------------------------------------------------------------------
     # Lifecycle

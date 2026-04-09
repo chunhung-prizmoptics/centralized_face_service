@@ -153,7 +153,6 @@ class RedisStreamReader:
                     return []
                 # raw = [(stream_name, [(msg_id, {field: value}), ...])]
                 _, messages = raw[0]
-                logger.debug(f"[{self._consumer}] xreadgroup → {len(messages)} message(s)")
                 return messages
             except redis.exceptions.ConnectionError as exc:
                 logger.warning(f"Redis read error ({exc}). Reconnecting…")

@@ -231,3 +231,10 @@ curl -X DELETE http://localhost:8000/faces/Alice
 ```bash
 curl http://localhost:8000/health
 ```
+
+
+### Check Redis
+
+```
+docker exec fusion-redis redis-cli --raw XINFO STREAM face_inference:results FULL COUNT 1  
+```
