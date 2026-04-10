@@ -154,7 +154,7 @@ class RedisStreamReader:
                 # raw = [(stream_name, [(msg_id, {field: value}), ...])]
                 _, messages = raw[0]
                 return messages
-            except redis.exceptions.ConnectionError as exc:
+            except (redis.exceptions.ConnectionError, redis.exceptions.ResponseError) as exc:
                 logger.warning(f"Redis read error ({exc}). Reconnecting…")
                 self._connect()
 
@@ -164,7 +164,7 @@ class RedisStreamReader:
             return
         try:
             self._client.xack(self._stream, self._group, *message_ids)
-        except redis.exceptions.ConnectionError as exc:
+        except (redis.exceptions.ConnectionError, redis.exceptions.ResponseError) as exc:
             logger.warning(f"Redis ACK error ({exc}). Messages may be reprocessed.")
 
 
@@ -207,3 +207,10 @@ class RedisStreamWriter:
             except redis.exceptions.ConnectionError as exc:
                 logger.warning(f"Redis write error ({exc}). Reconnecting…")
                 self._connect()
+
+    def set_key(self, key: str, value: bytes, ttl: int):
+        """Store a binary value under a plain Redis key with a TTL (seconds)."""
+        try:
+            self._client.set(key, value, ex=ttl)
+        except Exception as exc:
+            logger.warning(f"Redis SET {key} failed ({exc}).")

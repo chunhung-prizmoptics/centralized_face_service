@@ -63,3 +63,12 @@ NO_REID = os.getenv("NO_REID", "1") == "1"   # set "0" to enable ReID embeddings
 # Set to 0 to disable deadline filtering entirely.
 # This must be large enough to cover clock skew between producer and worker.
 DEADLINE_GRACE_MS = int(os.getenv("DEADLINE_GRACE_MS", "0"))  # 0 = disabled
+
+# -----------------------------------------------------------------------
+# Face crop key store
+# -----------------------------------------------------------------------
+# When > 0, the aligned 112×112 face crop is stored as a Redis key
+# "face_crop:{event_id}" with this TTL (seconds). Downstream consumers
+# can fetch it on demand without embedding binary in the result stream.
+# Set to 0 to disable.
+FACE_CROP_TTL = int(os.getenv("FACE_CROP_TTL", "60"))  # seconds

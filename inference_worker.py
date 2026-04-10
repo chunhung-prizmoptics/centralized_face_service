@@ -75,12 +75,15 @@ class BatchWorker(threading.Thread):
         self._stop_event = threading.Event()
         self._decode_pool = ThreadPoolExecutor(max_workers=decode_workers, thread_name_prefix="decode")
         self._deadline_grace_ms = deadline_grace_ms  # 0 = deadline filtering disabled
+        self._face_crop_ttl = config.FACE_CROP_TTL  # 0 = disabled
 
         # Throughput stats
         self._stats_lock = threading.Lock()
         self._stats_frames   = 0   # frames processed since last report
         self._stats_batches  = 0
         self._stats_last_ts  = time.monotonic()
+        # identity → (count, max_confidence) since last report
+        self._stats_identities: dict[str, tuple[int, float]] = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -320,16 +323,18 @@ class BatchWorker(threading.Thread):
     def _report_stats(self):
         now = time.monotonic()
         with self._stats_lock:
-            frames  = self._stats_frames
-            batches = self._stats_batches
-            elapsed = now - self._stats_last_ts
-            self._stats_frames  = 0
-            self._stats_batches = 0
-            self._stats_last_ts = now
+            frames     = self._stats_frames
+            batches    = self._stats_batches
+            elapsed    = now - self._stats_last_ts
+            identities = self._stats_identities.copy()
+            self._stats_frames     = 0
+            self._stats_batches    = 0
+            self._stats_last_ts    = now
+            self._stats_identities = {}
 
         fps = frames / elapsed if elapsed > 0 else 0.0
 
-        # Request stream lag = how many messages are queued but not yet delivered to this group
+        # Request stream lag
         req_lag = "?"
         result_len = "?"
         try:
@@ -353,6 +358,15 @@ class BatchWorker(threading.Thread):
             f"[{self.name}] Stats | {fps:.1f} fps  {frames} frames  "
             f"{batches} batches  req_queue={req_lag}  result_stream_len={result_len}"
         )
+
+        if identities:
+            # Sort: known identities first (not Unknown), then by count descending
+            sorted_ids = sorted(
+                identities.items(),
+                key=lambda x: (x[0] == "Unknown", -x[1][0])
+            )
+            parts = [f"{name}×{count}({best_conf:.2f})" for name, (count, best_conf) in sorted_ids]
+            logger.info(f"[{self.name}] Seen   | {' | '.join(parts)}")
 
     def _process_batch(self):
         messages = self._reader.read()
@@ -498,6 +512,18 @@ class BatchWorker(threading.Thread):
         except Exception:
             quality = 0.0
 
+        # Store original crop as a short-lived Redis key for on-demand downstream access
+        face_crop_key = ""
+        if self._face_crop_ttl > 0 and event_id:
+            raw_jpeg = fields.get(b"face_crop_jpeg") or fields.get("face_crop_jpeg")
+            if raw_jpeg:
+                try:
+                    face_crop_key = f"face_crop:{event_id}"
+                    self._writer.set_key(face_crop_key, bytes(raw_jpeg), self._face_crop_ttl)
+                except Exception as exc:
+                    logger.warning(f"[{event_id}] Failed to store face_crop key: {exc}")
+                    face_crop_key = ""
+
         result = {
             b"event_id":       fields.get(b"event_id", b""),
             b"camera_id":      fields.get(b"camera_id",  b""),
@@ -510,12 +536,15 @@ class BatchWorker(threading.Thread):
             b"pitch":          str(round(pitch, 2)).encode(),
             b"roll":           str(round(roll,  2)).encode(),
             b"quality":        str(round(quality, 4)).encode(),
+            b"face_crop_key":  face_crop_key.encode(),
             # b"embedding":      json.dumps(embedding.tolist()).encode(),
             # b"reid_embedding": json.dumps(reid_emb.tolist()).encode(),
         }
         self._writer.write(result)
         with self._stats_lock:
             self._stats_frames += 1
+            count, best = self._stats_identities.get(identity, (0, 0.0))
+            self._stats_identities[identity] = (count + 1, max(best, float(confidence)))
 
     # ------------------------------------------------------------------
     # Lifecycle
