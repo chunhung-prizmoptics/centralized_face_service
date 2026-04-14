@@ -56,6 +56,11 @@ RUN_DETECTION = os.getenv("RUN_DETECTION", "0") == "1"
 # -----------------------------------------------------------------------
 NO_REID = os.getenv("NO_REID", "1") == "1"   # set "0" to enable ReID embeddings
 
+# Enrollment API (runtime add/delete identities)
+API_ENABLED = os.getenv("API_ENABLED", "0") == "1"
+API_HOST    = os.getenv("API_HOST", "127.0.0.1")
+API_PORT    = int(os.getenv("API_PORT", "8000"))
+
 # -----------------------------------------------------------------------
 # Deadline filtering
 # -----------------------------------------------------------------------

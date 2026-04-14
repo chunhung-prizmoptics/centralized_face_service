@@ -175,13 +175,18 @@ Stream: `face_inference:results`
 ## Face Enrollment API
 
 The enrollment API lets you register or remove identities at runtime without
-restarting the service. Run it as a standalone process pointing at the same
-gallery and cache:
+restarting the service.
+
+Run it together with the inference service (same process, shared in-memory DB):
+
+```bash
+conda run -n face_rtsp_env python main.py --api --api-host 0.0.0.0 --api-port 8000
+```
+
+Or run it as a standalone process:
 
 ```bash
 conda run -n face_rtsp_env python face_api.py \
-    --gallery gallery \
-    --cache face_db_cache.npz \
     --host 0.0.0.0 --port 8000
 ```
 

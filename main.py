@@ -52,6 +52,11 @@ def parse_args():
     p.add_argument("--gpu-id",          type=int,   default=cfg.GPU_ID,           help=f"GPU device ID  [{cfg.GPU_ID}]")
     p.add_argument("--no-reid",         action="store_true", default=cfg.NO_REID, help="Skip ReID embedding")
     p.add_argument("--detect",          action="store_true", default=cfg.RUN_DETECTION, help="Run full SCRFD detection on each crop")
+    p.add_argument("--api",             dest="api", action="store_true", help="Start enrollment API server in this process")
+    p.add_argument("--no-api",          dest="api", action="store_false", help="Disable enrollment API server")
+    p.set_defaults(api=cfg.API_ENABLED)
+    p.add_argument("--api-host",        default=cfg.API_HOST,         help=f"Enrollment API bind host  [{cfg.API_HOST}]")
+    p.add_argument("--api-port",        type=int,   default=cfg.API_PORT,         help=f"Enrollment API bind port  [{cfg.API_PORT}]")
     return p.parse_args()
 
 
@@ -117,6 +122,9 @@ def main():
     logger.info(f"  GPU ID       : {args.gpu_id}")
     logger.info(f"  ReID         : {'disabled' if args.no_reid else 'enabled'}")
     logger.info(f"  Detection    : {'enabled (SCRFD)' if args.detect else 'disabled (landmark align)'}")
+    logger.info(f"  API          : {'enabled' if args.api else 'disabled'}")
+    if args.api:
+        logger.info(f"  API bind     : http://{args.api_host}:{args.api_port}")
     logger.info("=" * 60)
 
     # 1. Load models (shared across all workers)
@@ -124,6 +132,21 @@ def main():
     model_lock = threading.Lock()
     face_db    = build_face_db(args.gallery, args.cache, face_app)
     reid_model = load_reid(args.gpu_id, args.no_reid)
+
+    # Optional: run enrollment API in-process so identities can be added/removed live.
+    if args.api:
+        try:
+            from face_api import start_api_server
+
+            start_api_server(
+                face_db=face_db,
+                face_app=face_app,
+                model_lock=model_lock,
+                host=args.api_host,
+                port=args.api_port,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to start enrollment API ({exc}). Continuing without API.")
 
     # 2. Create Redis writer (shared)
     from queue_io import RedisStreamReader, RedisStreamWriter
