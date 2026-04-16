@@ -23,13 +23,19 @@ from reid_model import ReIDModel
 
 # 3D reference face model for 5-point landmark pose estimation (solvePnP).
 # Points: left_eye, right_eye, nose_tip, left_mouth, right_mouth.
-# Coordinates in mm from a generic 3D face model (Dlib/OpenFace convention).
+#
+# Y-axis matches IMAGE coordinate space (Y increases DOWNWARD), so:
+#   eyes   → Y negative (above nose in image = smaller Y value)
+#   mouth  → Y positive (below nose in image = larger Y value)
+# X-axis: positive = right in image.
+# Z-axis: positive = out of screen toward camera.
+# Mismatching Y convention with image coords causes ~180° pitch flip.
 _FACE_3D_MODEL = np.array([
-    [-165.0,  170.0, -135.0],  # left eye
-    [ 165.0,  170.0, -135.0],  # right eye
+    [-165.0, -170.0, -135.0],  # left eye
+    [ 165.0, -170.0, -135.0],  # right eye
     [   0.0,    0.0,    0.0],  # nose tip
-    [-150.0, -150.0, -125.0],  # left mouth
-    [ 150.0, -150.0, -125.0],  # right mouth
+    [-150.0,  150.0, -125.0],  # left mouth
+    [ 150.0,  150.0, -125.0],  # right mouth
 ], dtype=np.float32)
 
 
@@ -84,6 +90,8 @@ class BatchWorker(threading.Thread):
         self._stats_last_ts  = time.monotonic()
         # identity → (count, max_confidence) since last report
         self._stats_identities: dict[str, tuple[int, float]] = {}
+        # identity -> latest (yaw, pitch, roll) in current report window
+        self._stats_identity_pose: dict[str, tuple[float, float, float]] = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -129,7 +137,11 @@ class BatchWorker(threading.Thread):
 
         Returns a (5, 2) float32 array in absolute pixels, or None.
         """
-        raw = fields.get(b"landmark_5_xy") or fields.get("landmark_5_xy")
+        # landmark_5_xy_crop: crop-local normalized [0..1], used for alignment
+        raw = fields.get(b"landmark_5_xy_crop") or fields.get("landmark_5_xy_crop")
+        # fallback: legacy field name
+        if not raw:
+            raw = fields.get(b"landmark_5_xy") or fields.get("landmark_5_xy")
         if not raw:
             return None
 
@@ -155,12 +167,13 @@ class BatchWorker(threading.Thread):
                 pass
 
         if kps is None:
-            logger.warning(f"_parse_landmarks: could not parse landmark_5_xy: {raw!r}")
+            logger.warning(f"_parse_landmarks: could not parse landmark_5_xy_crop: {raw!r}")
             return None
 
-        # Scale normalized [0..1] → absolute pixel coords
-        kps[:, 0] *= w
-        kps[:, 1] *= h
+        # Scale normalized [0..1] → absolute pixel coords within crop.
+        # Upstream normalizes with (fcw-1)/(fch-1) denominator, so invert correctly.
+        kps[:, 0] *= max(w - 1, 1)
+        kps[:, 1] *= max(h - 1, 1)
         return kps
 
     def _align_crop(self, img: np.ndarray, fields: dict) -> np.ndarray:
@@ -178,29 +191,74 @@ class BatchWorker(threading.Thread):
             return face_align.norm_crop(img, landmark=kps)
         return cv2.resize(img, (112, 112))
 
+    def _parse_fullframe_landmarks(self, fields: dict) -> Optional[Tuple[np.ndarray, float, float]]:
+        """
+        Parse full-frame absolute landmarks + frame dimensions for accurate solvePnP.
+
+        Expects upstream to send:
+          - landmark_5_xy_abs: 10 comma-separated absolute pixel coords in the full camera frame
+          - frame_width:  full camera frame width in pixels
+          - frame_height: full camera frame height in pixels
+
+        Returns (kps_abs (5,2 float32), frame_w, frame_h), or None if fields absent.
+        """
+        # landmark_5_xy: full-frame absolute pixel coords (for pose geometry)
+        raw = fields.get(b"landmark_5_xy") or fields.get("landmark_5_xy")
+        fw  = fields.get(b"full_frame_width")  or fields.get("full_frame_width")
+        fh  = fields.get(b"full_frame_height") or fields.get("full_frame_height")
+        if raw is None or fw is None or fh is None:
+            return None
+        try:
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode(errors="replace")
+            vals = [float(v.strip()) for v in raw.split(",")]
+            if len(vals) != 10:
+                return None
+            kps = np.array(vals, dtype=np.float32).reshape(5, 2)
+            return kps, float(fw), float(fh)
+        except Exception:
+            return None
+
     def _estimate_pose(self, fields: dict, img: np.ndarray) -> Tuple[float, float, float]:
         """
-        Estimate head pose (yaw, pitch, roll) in degrees from the 5 RetinaFace
-        landmarks sent by the producer.  Uses solvePnP with a generic 3D face model.
+        Estimate head pose (yaw, pitch, roll) in degrees.
 
-        Returns (yaw, pitch, roll) or (0.0, 0.0, 0.0) if landmarks are unavailable.
+        Preferred path (accurate): upstream sends `landmark_5_xy_abs` (absolute
+        full-frame pixel coords) plus `frame_width` / `frame_height`.  The camera
+        matrix is built from the full sensor size, giving geometrically correct angles.
 
-        Sign convention (right-hand rule):
-          yaw   > 0 → face turned right
-          pitch > 0 → face tilted up
-          roll  > 0 → face rolled counter-clockwise
+        Fallback: crop-local normalized landmarks + crop dimensions for the camera
+        matrix.  This is less accurate but avoids breaking existing producers.
+
+        Sign/axis convention follows InsightFace transform.matrix2angle:
+          pitch = x = atan2(R[2,1], R[2,2])
+          yaw   = y = atan2(-R[2,0], sy)
+          roll  = z = atan2(R[1,0], R[0,0])
         """
-        kps = self._parse_landmarks(fields, img)
-        if kps is None:
-            return 0.0, 0.0, 0.0
-        try:
+        # --- Preferred: full-frame absolute landmarks ---
+        full = self._parse_fullframe_landmarks(fields)
+        if full is not None:
+            kps, fw, fh = full
+            focal = fw  # focal ≈ frame width (pinhole approximation)
+            cam_matrix = np.array([
+                [focal, 0,     fw / 2],
+                [0,     focal, fh / 2],
+                [0,     0,     1     ],
+            ], dtype=np.float32)
+        else:
+            # --- Fallback: crop-local landmarks (less accurate for pose) ---
+            kps = self._parse_landmarks(fields, img)
+            if kps is None:
+                return 0.0, 0.0, 0.0
             h, w = img.shape[:2]
-            focal = w  # rough approximation: focal ≈ image width
+            focal = float(w)
             cam_matrix = np.array([
                 [focal, 0,     w / 2],
                 [0,     focal, h / 2],
                 [0,     0,     1    ],
             ], dtype=np.float32)
+
+        try:
             dist_coeffs = np.zeros((4, 1), dtype=np.float32)
 
             _, rvec, _ = cv2.solvePnP(
@@ -211,13 +269,15 @@ class BatchWorker(threading.Thread):
             sy = np.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2)
             singular = sy < 1e-6
             if not singular:
-                pitch = float(np.degrees(np.arctan2(-rmat[2, 0], sy)))
-                yaw   = float(np.degrees(np.arctan2( rmat[2, 1], rmat[2, 2])))
+                # Same as insightface.utils.transform.matrix2angle:
+                # x=pitch, y=yaw, z=roll
+                pitch = float(np.degrees(np.arctan2(rmat[2, 1], rmat[2, 2])))
+                yaw   = float(np.degrees(np.arctan2(-rmat[2, 0], sy)))
                 roll  = float(np.degrees(np.arctan2( rmat[1, 0], rmat[0, 0])))
             else:
-                pitch = float(np.degrees(np.arctan2(-rmat[2, 0], sy)))
-                yaw   = 0.0
-                roll  = float(np.degrees(np.arctan2(-rmat[1, 2], rmat[1, 1])))
+                pitch = float(np.degrees(np.arctan2(-rmat[1, 2], rmat[1, 1])))
+                yaw   = float(np.degrees(np.arctan2(-rmat[2, 0], sy)))
+                roll  = 0.0
             return round(yaw, 2), round(pitch, 2), round(roll, 2)
         except Exception as exc:
             logger.debug(f"_estimate_pose failed: {exc}")
@@ -327,10 +387,12 @@ class BatchWorker(threading.Thread):
             batches    = self._stats_batches
             elapsed    = now - self._stats_last_ts
             identities = self._stats_identities.copy()
+            identity_pose = self._stats_identity_pose.copy()
             self._stats_frames     = 0
             self._stats_batches    = 0
             self._stats_last_ts    = now
             self._stats_identities = {}
+            self._stats_identity_pose = {}
 
         fps = frames / elapsed if elapsed > 0 else 0.0
 
@@ -365,7 +427,12 @@ class BatchWorker(threading.Thread):
                 identities.items(),
                 key=lambda x: (x[0] == "Unknown", -x[1][0])
             )
-            parts = [f"{name}×{count}({best_conf:.2f})" for name, (count, best_conf) in sorted_ids]
+            parts = []
+            for name, (count, best_conf) in sorted_ids:
+                yaw, pitch, roll = identity_pose.get(name, (0.0, 0.0, 0.0))
+                parts.append(
+                    f"{name}×{count}({best_conf:.2f}) (y:{yaw:+.1f},p:{pitch:+.1f},r:{roll:+.1f})"
+                )
             logger.info(f"[{self.name}] Seen   | {' | '.join(parts)}")
 
     def _process_batch(self):
@@ -427,35 +494,35 @@ class BatchWorker(threading.Thread):
                 event_id = fields.get(b"event_id", b"").decode(errors="replace")
                 logger.warning(f"[{event_id}] JPEG decode failed.")
                 self._publish_error(fields, "decode_failed")
-                return fields, None
-            return fields, self._align_crop(img, fields)
+                return fields, None, None
+            return fields, img, self._align_crop(img, fields)
 
         decoded = list(self._decode_pool.map(_decode_one, fields_list))
 
-        valid = [(fields, crop) for fields, crop in decoded if crop is not None]
+        valid = [(fields, raw_img, crop) for fields, raw_img, crop in decoded if crop is not None]
         if not valid:
             return
 
         # --- Stage 2: single batched GPU call ---
         # get_feat expects a list of (112,112,3) images, NOT a stacked (N,112,112,3) array.
-        crops_list = [crop for _, crop in valid]
+        crops_list = [crop for _, _, crop in valid]
         try:
             with self._model_lock:
                 embeddings = rec_model.get_feat(crops_list)  # (N, 512)
             embeddings = np.array(embeddings)
         except Exception as exc:
             logger.exception(f"_process_batch_direct: rec_model.get_feat failed — {exc}")
-            for fields, _ in valid:
+            for fields, _, _ in valid:
                 self._publish_error(fields, f"insightface_error:{exc}")
             return
 
         # --- Stage 3: match + ReID + publish ---
-        for i, (fields, crop) in enumerate(valid):
+        for i, (fields, raw_img, crop) in enumerate(valid):
             emb = embeddings[i]
             if np.linalg.norm(emb) < 1e-3:
                 self._publish_error(fields, "no_face_detected")
                 continue
-            self._publish_result(fields, emb, crop, crop if not self._no_reid else None)
+            self._publish_result(fields, emb, crop, crop if not self._no_reid else None, pose_img=raw_img)
 
     def _process_single_detect(self, fields: dict):
         """
@@ -482,9 +549,16 @@ class BatchWorker(threading.Thread):
             self._publish_error(fields, "no_face_detected")
             return
 
-        self._publish_result(fields, embedding, img, img if not self._no_reid else None)
+        self._publish_result(fields, embedding, img, img if not self._no_reid else None, pose_img=img)
 
-    def _publish_result(self, fields: dict, embedding: np.ndarray, crop: np.ndarray, img_for_reid):
+    def _publish_result(
+        self,
+        fields: dict,
+        embedding: np.ndarray,
+        crop: np.ndarray,
+        img_for_reid,
+        pose_img: Optional[np.ndarray] = None,
+    ):
         """Match embedding, run ReID if needed, publish to result stream."""
         event_id = fields.get(b"event_id", b"").decode(errors="replace")
 
@@ -504,7 +578,7 @@ class BatchWorker(threading.Thread):
 
         # Pose and quality — best-effort, never block publish on failure
         try:
-            yaw, pitch, roll = self._estimate_pose(fields, crop)
+            yaw, pitch, roll = self._estimate_pose(fields, pose_img if pose_img is not None else crop)
         except Exception:
             yaw, pitch, roll = 0.0, 0.0, 0.0
         try:
@@ -545,6 +619,7 @@ class BatchWorker(threading.Thread):
             self._stats_frames += 1
             count, best = self._stats_identities.get(identity, (0, 0.0))
             self._stats_identities[identity] = (count + 1, max(best, float(confidence)))
+            self._stats_identity_pose[identity] = (float(yaw), float(pitch), float(roll))
 
     # ------------------------------------------------------------------
     # Lifecycle

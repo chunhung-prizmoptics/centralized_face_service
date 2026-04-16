@@ -66,7 +66,8 @@ Each subfolder name becomes the identity label. Supported formats: `.jpg`, `.jpe
 All defaults are set in `config.py`. Just run:
 
 ```bash
-conda run -n face_rtsp_env python centralized_face_service/main.py
+conda run -n face_rtsp_env # or conda activate face_rtsp_env if exists
+python centralized_face_service/main.py --api --api-host 0.0.0.0 --api-port 8000
 ```
 
 Override specific settings via CLI:
@@ -146,7 +147,10 @@ All field values are raw bytes (not base64, not JSON-encoded strings).
 | `track_id`       | string/int  | yes      | Person track ID from upstream tracker                        |
 | `timestamp`      | string/int  | yes      | Unix timestamp in milliseconds                               |
 | `face_crop_jpeg` | bytes       | yes      | Raw JPEG-encoded face crop                                   |
-| `landmark_5_xy`  | string      | no       | 5-point landmarks, normalized [0..1] within the crop as CSV: `x0,y0,x1,y1,...,x4,y4` (order: left_eye, right_eye, nose, left_mouth, right_mouth). When present, enables precise `norm_crop` alignment. |
+| `landmark_5_xy_crop` | string  | no       | 5-point landmarks **normalized [0..1] within the face crop** as CSV: `x0,y0,...,x4,y4` (order: left_eye, right_eye, nose, left_mouth, right_mouth). Used for precise `norm_crop` alignment into ArcFace. |
+| `landmark_5_xy`  | string      | no       | Same 5 landmarks as **absolute pixel coordinates in the full camera frame**: `x0,y0,...,x4,y4`. When present together with `full_frame_width`/`full_frame_height`, enables geometrically accurate yaw/pitch/roll via solvePnP. |
+| `full_frame_width`  | int      | no       | Full camera frame width in pixels. Required for accurate pose when `landmark_5_xy` is sent. |
+| `full_frame_height` | int      | no       | Full camera frame height in pixels. Required for accurate pose when `landmark_5_xy` is sent. |
 
 ---
 
@@ -242,4 +246,10 @@ curl http://localhost:8000/health
 
 ```
 docker exec fusion-redis redis-cli --raw XREVRANGE face_inference:results + - COUNT 1
+```
+
+To get the face image in face_crop , use key
+```
+docker exec fusion-redis redis-cli --raw XREVRANGE face_inference:results + - COUNT 1 #get the key
+docker exec fusion-redis redis-cli --raw GET face_crop:192.168.50.86_stream0_1776155037762_115029 > temp.png
 ```

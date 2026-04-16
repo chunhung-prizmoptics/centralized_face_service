@@ -33,7 +33,7 @@ REQUEST_MAXLEN  = int(os.getenv("REQUEST_MAXLEN", "1000"))    # max JPEG crops k
 # -----------------------------------------------------------------------
 # Matching
 # -----------------------------------------------------------------------
-MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.35"))
+MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.40"))
 
 # -----------------------------------------------------------------------
 # Gallery / cache
@@ -77,3 +77,10 @@ DEADLINE_GRACE_MS = int(os.getenv("DEADLINE_GRACE_MS", "0"))  # 0 = disabled
 # can fetch it on demand without embedding binary in the result stream.
 # Set to 0 to disable.
 FACE_CROP_TTL = int(os.getenv("FACE_CROP_TTL", "60"))  # seconds
+
+# -----------------------------------------------------------------------
+# Pose output calibration
+# -----------------------------------------------------------------------
+# Apply wrapped yaw offset to compensate convention/frame flips.
+# Effective formula: wrapTo180(yaw + POSE_YAW_OFFSET_DEG)
+POSE_YAW_OFFSET_DEG = float(os.getenv("POSE_YAW_OFFSET_DEG", "0"))
