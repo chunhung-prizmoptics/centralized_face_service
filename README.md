@@ -241,6 +241,49 @@ curl -X DELETE http://localhost:8000/faces/Alice
 curl http://localhost:8000/health
 ```
 
+---
+
+## Throughput Load Test
+
+Use the replay load writer to duplicate recent request rows back into
+`face_inference:requests` at a controlled rate.
+
+Script:
+
+```bash
+python centralized_face_service/tests/redis_stream_load_replay.py \
+  --redis-url redis://localhost:6379 \
+  --stream face_inference:requests \
+  --sample-size 100 \
+  --rate 100 \
+  --burst-size 20 \
+  --duration 120 \
+  --print-every 2
+```
+
+Windows PowerShell example:
+
+```powershell
+& "C:\Users\prizm\.conda\envs\face_rtsp_env\python.exe" centralized_face_service/tests/redis_stream_load_replay.py --redis-url redis://localhost:6379 --stream face_inference:requests --sample-size 100 --rate 100 --burst-size 20 --duration 120 --print-every 2
+```
+
+Recommended staircase test:
+
+1. `--rate 100 --duration 120`
+2. `--rate 200 --duration 120`
+3. `--rate 300 --duration 120`
+4. `--rate 400 --duration 120`
+
+What to watch in service logs:
+
+- `Stats | ... req_queue=...` from workers
+- total worker FPS across all workers
+
+Interpretation:
+
+- `req_queue` flat/near 0: service keeps up
+- `req_queue` steadily rising: overloaded at that input rate
+
 
 ### Check Redis
 

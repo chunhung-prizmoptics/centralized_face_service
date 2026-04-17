@@ -42,6 +42,8 @@ def parse_args():
     p.add_argument("--request-stream",  default=cfg.REQUEST_STREAM,   help=f"Redis input stream  [{cfg.REQUEST_STREAM}]")
     p.add_argument("--result-stream",   default=cfg.RESULT_STREAM,    help=f"Redis output stream  [{cfg.RESULT_STREAM}]")
     p.add_argument("--consumer-group",  default=cfg.CONSUMER_GROUP,   help=f"Redis consumer group  [{cfg.CONSUMER_GROUP}]")
+    p.add_argument("--consumer-prefix", default=cfg.CONSUMER_PREFIX,  help=f"Redis consumer prefix  [{cfg.CONSUMER_PREFIX}]")
+    p.add_argument("--instance-id",     default=cfg.INSTANCE_ID,      help="Instance id suffix for consumer names (default: host_pid)")
     p.add_argument("--batch-size",      type=int,   default=cfg.BATCH_SIZE,       help=f"Inference batch size  [{cfg.BATCH_SIZE}]")
     p.add_argument("--workers",         type=int,   default=cfg.WORKERS,          help=f"Parallel BatchWorker threads  [{cfg.WORKERS}]")
     p.add_argument("--decode-workers",  type=int,   default=cfg.DECODE_WORKERS,   help=f"CPU decode threads per worker  [{cfg.DECODE_WORKERS}]")
@@ -109,12 +111,18 @@ def build_face_db(gallery: str, cache: str, face_app):
 def main():
     args = parse_args()
 
+    # Use stable, per-process consumer namespace to avoid cross-instance collisions.
+    host = os.getenv("COMPUTERNAME") or os.getenv("HOSTNAME") or "host"
+    instance_id = args.instance_id.strip() if args.instance_id else f"{host}_{os.getpid()}"
+    instance_id = instance_id.replace(" ", "_").replace(":", "_").replace("/", "_").replace("\\", "_")
+
     logger.info("=" * 60)
     logger.info("  Centralized GPU Face Recognition Service")
     logger.info("=" * 60)
     logger.info(f"  Redis URL    : {args.redis_url}")
     logger.info(f"  Req stream   : {args.request_stream}")
     logger.info(f"  Res stream   : {args.result_stream}")
+    logger.info(f"  Consumer ns  : {args.consumer_prefix}_{instance_id}_w*")
     logger.info(f"  Gallery      : {args.gallery}")
     logger.info(f"  Batch size   : {args.batch_size}")
     logger.info(f"  Workers      : {args.workers}  (decode threads/worker: {args.decode_workers})")
@@ -160,11 +168,12 @@ def main():
     from inference_worker import BatchWorker
     workers = []
     for i in range(args.workers):
+        consumer_name = f"{args.consumer_prefix}_{instance_id}_w{i}"
         reader = RedisStreamReader(
             redis_url=args.redis_url,
             stream=args.request_stream,
             group=args.consumer_group,
-            consumer=f"worker_{i}",
+            consumer=consumer_name,
             batch_size=args.batch_size,
             block_ms=cfg.BATCH_TIMEOUT_MS,
             request_maxlen=args.request_maxlen if (i == 0 and args.request_maxlen > 0) else None,

@@ -15,13 +15,17 @@ REQUEST_STREAM  = os.getenv("REQUEST_STREAM",   "face_inference:requests")
 RESULT_STREAM   = os.getenv("RESULT_STREAM",    "face_inference:results")
 CONSUMER_GROUP  = os.getenv("CONSUMER_GROUP",   "face_inference_workers")
 CONSUMER_NAME   = os.getenv("CONSUMER_NAME",    "worker_0")
+CONSUMER_PREFIX = os.getenv("CONSUMER_PREFIX",  "worker")
+# Optional stable instance id for multi-process/multi-host deployments.
+# If empty, main.py derives one from host + pid at startup.
+INSTANCE_ID     = os.getenv("INSTANCE_ID",       "")
 
 # -----------------------------------------------------------------------
 # Batching / workers
 # -----------------------------------------------------------------------
-BATCH_SIZE       = int(os.getenv("BATCH_SIZE",       "16"))
+BATCH_SIZE       = int(os.getenv("BATCH_SIZE",       "32"))
 BATCH_TIMEOUT_MS = int(os.getenv("BATCH_TIMEOUT_MS", "50"))   # ms to wait before flushing a partial batch
-WORKERS          = int(os.getenv("WORKERS",          "2"))    # parallel BatchWorker threads
+WORKERS          = int(os.getenv("WORKERS",          "4"))    # parallel BatchWorker threads
 DECODE_WORKERS   = int(os.getenv("DECODE_WORKERS",   "4"))    # CPU threads for JPEG decode per worker
 
 # -----------------------------------------------------------------------
@@ -77,10 +81,3 @@ DEADLINE_GRACE_MS = int(os.getenv("DEADLINE_GRACE_MS", "0"))  # 0 = disabled
 # can fetch it on demand without embedding binary in the result stream.
 # Set to 0 to disable.
 FACE_CROP_TTL = int(os.getenv("FACE_CROP_TTL", "60"))  # seconds
-
-# -----------------------------------------------------------------------
-# Pose output calibration
-# -----------------------------------------------------------------------
-# Apply wrapped yaw offset to compensate convention/frame flips.
-# Effective formula: wrapTo180(yaw + POSE_YAW_OFFSET_DEG)
-POSE_YAW_OFFSET_DEG = float(os.getenv("POSE_YAW_OFFSET_DEG", "0"))

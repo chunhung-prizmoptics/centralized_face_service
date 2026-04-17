@@ -41,8 +41,21 @@ _face_db: FaceDatabase = None
 _face_app = None
 _model_lock = threading.Lock()  # shared with realtime_face_recognition.py
 
+# Y-axis aligned to image coordinates (downward-positive) for solvePnP consistency.
+_FACE_3D_MODEL = np.array([
+    [-165.0, -170.0, -135.0],
+    [ 165.0, -170.0, -135.0],
+    [   0.0,    0.0,    0.0],
+    [-150.0,  150.0, -125.0],
+    [ 150.0,  150.0, -125.0],
+], dtype=np.float32)
 
-def init_api(face_db: FaceDatabase, face_app, model_lock: threading.Lock = None):
+
+def init_api(
+    face_db: FaceDatabase,
+    face_app,
+    model_lock: threading.Lock = None,
+):
     global _face_db, _face_app, _model_lock
     _face_db = face_db
     _face_app = face_app
@@ -58,17 +71,101 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _extract_embeddings(image_bytes: bytes) -> list:
-    """Decode image bytes, run face detection, return list of embeddings."""
+def _estimate_pose_from_kps(kps: np.ndarray, img_w: int, img_h: int) -> tuple[float, float, float]:
+    """Estimate (yaw, pitch, roll) from 5-point landmarks in absolute image pixels."""
+    focal = float(img_w)
+    cam_matrix = np.array([
+        [focal, 0,     img_w / 2],
+        [0,     focal, img_h / 2],
+        [0,     0,     1        ],
+    ], dtype=np.float32)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float32)
+
+    ok, rvec, _ = cv2.solvePnP(_FACE_3D_MODEL, kps.astype(np.float32), cam_matrix, dist_coeffs, flags=cv2.SOLVEPNP_EPNP)
+    if not ok:
+        return 0.0, 0.0, 0.0
+    rmat, _ = cv2.Rodrigues(rvec)
+
+    # InsightFace matrix2angle convention: x=pitch, y=yaw, z=roll
+    sy = float(np.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2))
+    singular = sy < 1e-6
+    if not singular:
+        pitch = float(np.degrees(np.arctan2(rmat[2, 1], rmat[2, 2])))
+        yaw = float(np.degrees(np.arctan2(-rmat[2, 0], sy)))
+        roll = float(np.degrees(np.arctan2(rmat[1, 0], rmat[0, 0])))
+    else:
+        pitch = float(np.degrees(np.arctan2(-rmat[1, 2], rmat[1, 1])))
+        yaw = float(np.degrees(np.arctan2(-rmat[2, 0], sy)))
+        roll = 0.0
+    return yaw, pitch, roll
+
+
+def _extract_embeddings(image_bytes: bytes) -> tuple[list, list[dict]]:
+    """Decode image bytes, detect faces, and return embeddings plus per-face quality diagnostics."""
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError("Cannot decode image – unsupported format or corrupt file.")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    img_h, img_w = gray.shape[:2]
+
     with _model_lock:
         faces = _face_app.get(img)
     if not faces:
         raise ValueError("No face detected in the provided image.")
-    return [f.embedding for f in faces if f.embedding is not None]
+
+    selected = []
+    diagnostics: list[dict] = []
+    for f in faces:
+        emb = getattr(f, "embedding", None)
+        bbox = getattr(f, "bbox", None)
+        if emb is None or bbox is None:
+            continue
+
+        x1, y1, x2, y2 = [int(round(v)) for v in bbox]
+        x1 = max(0, min(x1, img_w - 1))
+        y1 = max(0, min(y1, img_h - 1))
+        x2 = max(x1 + 1, min(x2, img_w))
+        y2 = max(y1 + 1, min(y2, img_h))
+        bw = float(x2 - x1)
+        bh = float(y2 - y1)
+
+        face_gray = gray[y1:y2, x1:x2]
+        if face_gray.size == 0:
+            diagnostics.append({"valid_crop": False})
+            continue
+
+        sharpness = float(cv2.Laplacian(face_gray, cv2.CV_64F).var())
+        brightness = float(face_gray.mean())
+        dark_ratio = float((face_gray < 40).mean())
+        yaw, pitch, roll = 0.0, 0.0, 0.0
+
+        kps = getattr(f, "kps", None)
+        if kps is not None and np.asarray(kps).shape == (5, 2):
+            yaw, pitch, roll = _estimate_pose_from_kps(np.asarray(kps, dtype=np.float32), img_w, img_h)
+
+        diagnostics.append(
+            {
+                "valid_crop": True,
+                "bbox": [x1, y1, x2, y2],
+                "size_w": round(bw, 1),
+                "size_h": round(bh, 1),
+                "size_min": round(min(bw, bh), 1),
+                "sharpness": round(sharpness, 2),
+                "brightness": round(brightness, 2),
+                "dark_ratio": round(dark_ratio, 4),
+                "yaw": round(yaw, 2),
+                "pitch": round(pitch, 2),
+                "roll": round(roll, 2),
+            }
+        )
+
+        selected.append(emb)
+
+    if not selected:
+        raise ValueError("No valid face embeddings extracted from detected faces.")
+
+    return selected, diagnostics
 
 
 # ------------------------------------------------------------------
@@ -94,12 +191,13 @@ async def register_face(
     else:
         identity_id = str(uuid.uuid4())
 
-    embeddings, warnings = [], []
+    embeddings, warnings, quality_reports = [], [], []
     for f in files:
         try:
             data = await f.read()
-            embs = _extract_embeddings(data)
+            embs, diag = _extract_embeddings(data)
             embeddings.extend(embs)
+            quality_reports.append({"file": f.filename, "faces": diag})
         except Exception as exc:
             warnings.append(f"{f.filename}: {exc}")
 
@@ -121,6 +219,7 @@ async def register_face(
         "embeddings_added": len(embeddings),
         "timestamp": _now_iso(),
         "warnings": warnings,
+        "quality_reports": quality_reports,
     }
 
 
@@ -136,12 +235,13 @@ async def update_face(
     if mode not in ("append", "replace"):
         raise HTTPException(400, "mode must be 'append' or 'replace'.")
 
-    embeddings, warnings = [], []
+    embeddings, warnings, quality_reports = [], [], []
     for f in files:
         try:
             data = await f.read()
-            embs = _extract_embeddings(data)
+            embs, diag = _extract_embeddings(data)
             embeddings.extend(embs)
+            quality_reports.append({"file": f.filename, "faces": diag})
         except Exception as exc:
             warnings.append(f"{f.filename}: {exc}")
 
@@ -157,6 +257,7 @@ async def update_face(
         "embeddings_added": len(embeddings),
         "timestamp": _now_iso(),
         "warnings": warnings,
+        "quality_reports": quality_reports,
     }
 
 
