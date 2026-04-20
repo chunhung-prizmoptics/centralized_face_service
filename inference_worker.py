@@ -65,6 +65,9 @@ class BatchWorker(threading.Thread):
         run_detection: bool = False,
         decode_workers: int = 4,
         deadline_grace_ms: int = config.DEADLINE_GRACE_MS,
+        track_cache_ttl: int = config.TRACK_CACHE_TTL,
+        track_cache_recheck: int = config.TRACK_CACHE_RECHECK,
+        track_cache_unknown_recheck: int = config.TRACK_CACHE_UNKNOWN_RECHECK,
     ):
         super().__init__(daemon=True)
         self._reader = reader
@@ -82,6 +85,20 @@ class BatchWorker(threading.Thread):
         self._decode_pool = ThreadPoolExecutor(max_workers=decode_workers, thread_name_prefix="decode")
         self._deadline_grace_ms = deadline_grace_ms  # 0 = deadline filtering disabled
         self._face_crop_ttl = config.FACE_CROP_TTL  # 0 = disabled
+
+        # Per-track identity cache.
+        # Once a track is confidently matched, subsequent frames for the same
+        # (camera_id, track_id) skip GPU inference and re-publish the cached
+        # result directly.  Cache entry expires after TRACK_CACHE_TTL seconds
+        # of inactivity (track left scene) or is force-rechecked every
+        # TRACK_CACHE_RECHECK seconds to catch genuine identity changes.
+        # (camera_id, track_id) → {identity, identity_id, confidence, yaw, pitch, roll,
+        #                          quality, last_seen, last_infer}
+        self._track_cache_ttl              = track_cache_ttl
+        self._track_cache_recheck          = track_cache_recheck
+        self._track_cache_unknown_recheck  = track_cache_unknown_recheck if track_cache_unknown_recheck > 0 else track_cache_recheck
+        self._track_cache: dict[tuple, dict] = {}
+        self._track_cache_lock = threading.Lock()
 
         # Throughput stats
         self._stats_lock = threading.Lock()
@@ -283,6 +300,52 @@ class BatchWorker(threading.Thread):
             logger.debug(f"_estimate_pose failed: {exc}")
             return 0.0, 0.0, 0.0
 
+    def _track_cache_get(self, camera_id: str, track_id: str, now: float) -> Optional[dict]:
+        """
+        Return a cached result for (camera_id, track_id) if it is still valid,
+        or None if inference should run.
+
+        A cached entry is returned when:
+          - It exists and was seen within TRACK_CACHE_TTL seconds (track still active), AND
+          - It was last inferred within TRACK_CACHE_RECHECK seconds (not due for recheck).
+
+        Cache is disabled when TRACK_CACHE_TTL == 0.
+        """
+        if self._track_cache_ttl <= 0:
+            return None
+        key = (camera_id, track_id)
+        with self._track_cache_lock:
+            entry = self._track_cache.get(key)
+            if entry is None:
+                return None
+            if now - entry["last_seen"] > self._track_cache_ttl:
+                # Track went idle — evict and re-infer
+                del self._track_cache[key]
+                return None
+            entry["last_seen"] = now
+            recheck = (self._track_cache_unknown_recheck
+                       if entry.get("identity") == "Unknown"
+                       else self._track_cache_recheck)
+            if recheck > 0 and now - entry["last_infer"] > recheck:
+                # Due for a periodic re-inference to catch genuine identity changes
+                return None
+            return entry
+
+    def _track_cache_put(self, camera_id: str, track_id: str, now: float, entry: dict):
+        """Store or update a confident match in the track cache."""
+        if self._track_cache_ttl <= 0:
+            return
+        key = (camera_id, track_id)
+        entry = dict(entry, last_seen=now, last_infer=now)
+        with self._track_cache_lock:
+            self._track_cache[key] = entry
+            # Evict stale entries piggyback (no extra thread needed)
+            if len(self._track_cache) > 10_000:
+                cutoff = now - self._track_cache_ttl
+                stale = [k for k, v in self._track_cache.items() if v["last_seen"] < cutoff]
+                for k in stale:
+                    del self._track_cache[k]
+
     @staticmethod
     def _estimate_quality(img: np.ndarray) -> float:
         """
@@ -441,6 +504,7 @@ class BatchWorker(threading.Thread):
             return
 
         now_ms = int(time.time() * 1000)
+        now_s  = now_ms / 1000.0
         live, stale_ids = [], []
         for msg_id, fields in messages:
             if self._deadline_grace_ms > 0:
@@ -453,10 +517,25 @@ class BatchWorker(threading.Thread):
                             continue
                     except (ValueError, TypeError):
                         pass
+
+            # Per-track cache check: if this (camera_id, track_id) was already
+            # confidently matched recently, re-publish the cached result without
+            # running GPU inference again.
+            cam_raw   = fields.get(b"camera_id")  or fields.get("camera_id")  or b""
+            track_raw = fields.get(b"track_id")   or fields.get("track_id")   or b""
+            camera_id = cam_raw.decode(errors="replace")   if isinstance(cam_raw,   (bytes, bytearray)) else str(cam_raw)
+            track_id  = track_raw.decode(errors="replace") if isinstance(track_raw, (bytes, bytearray)) else str(track_raw)
+
+            cached = self._track_cache_get(camera_id, track_id, now_s)
+            if cached is not None:
+                # Re-publish from cache, skip GPU pipeline entirely
+                self._publish_cached(fields, cached)
+                stale_ids.append(msg_id)  # ack alongside stale
+                continue
+
             live.append((msg_id, fields))
 
         if stale_ids:
-            logger.debug(f"Dropped {len(stale_ids)} stale message(s) past deadline.")
             self._reader.ack(stale_ids)
 
         if not live:
@@ -604,7 +683,7 @@ class BatchWorker(threading.Thread):
             b"track_id":       fields.get(b"track_id",   b""),
             b"timestamp":      fields.get(b"timestamp",  b""),
             b"identity":       identity.encode(),
-            b"identity_id":    identity_id.encode(),
+            b"identity_id":    identity.encode(),   # DEBUG: name instead of UUID for easy tracing
             b"confidence":     str(round(float(confidence), 6)).encode(),
             b"yaw":            str(round(yaw,   2)).encode(),
             b"pitch":          str(round(pitch, 2)).encode(),
@@ -620,6 +699,79 @@ class BatchWorker(threading.Thread):
             count, best = self._stats_identities.get(identity, (0, 0.0))
             self._stats_identities[identity] = (count + 1, max(best, float(confidence)))
             self._stats_identity_pose[identity] = (float(yaw), float(pitch), float(roll))
+
+        # Cache all tracks (including Unknown) so prolonged stationary faces
+        # don't monopolise GPU inference slots on every frame.
+        # Unknown tracks use a shorter recheck so newly enrolled persons are
+        # recognised promptly.
+        cam_raw   = fields.get(b"camera_id") or fields.get("camera_id") or b""
+        track_raw = fields.get(b"track_id")  or fields.get("track_id")  or b""
+        camera_id = cam_raw.decode(errors="replace")   if isinstance(cam_raw,   (bytes, bytearray)) else str(cam_raw)
+        track_id  = track_raw.decode(errors="replace") if isinstance(track_raw, (bytes, bytearray)) else str(track_raw)
+        self._track_cache_put(camera_id, track_id, time.monotonic(), {
+            "identity":    identity,
+            "identity_id": identity_id,
+            "confidence":  confidence,
+            "yaw": yaw, "pitch": pitch, "roll": roll,
+            "quality": quality,
+        })
+
+    def _publish_cached(self, fields: dict, cached: dict):
+        """Re-publish a previously cached identity result without running inference.
+
+        For Unknown tracks: perform a cheap CPU quality check on the raw JPEG.
+        If this frame is sharper than the best seen so far for this track, store
+        it as a face_crop_key so downstream enrollment can use it as a candidate.
+        Known tracks: no crop stored (identity already confirmed, no need).
+        """
+        event_id = fields.get(b"event_id", b"").decode(errors="replace")
+        face_crop_key = b""
+
+        if cached["identity"] == "Unknown" and self._face_crop_ttl > 0 and event_id:
+            raw_jpeg = fields.get(b"face_crop_jpeg") or fields.get("face_crop_jpeg")
+            if raw_jpeg:
+                try:
+                    img = self._decode_jpeg(bytes(raw_jpeg))
+                    if img is not None:
+                        quality = self._estimate_quality(img)
+                        # Only store if this frame is better than the cached best quality
+                        if quality > cached.get("best_crop_quality", 0.0):
+                            key = f"face_crop:{event_id}"
+                            self._writer.set_key(key, bytes(raw_jpeg), self._face_crop_ttl)
+                            face_crop_key = key.encode()
+                            # Update best quality in the cache (under lock)
+                            cam_raw   = fields.get(b"camera_id") or fields.get("camera_id") or b""
+                            track_raw = fields.get(b"track_id")  or fields.get("track_id")  or b""
+                            camera_id = cam_raw.decode(errors="replace")   if isinstance(cam_raw,   (bytes, bytearray)) else str(cam_raw)
+                            track_id  = track_raw.decode(errors="replace") if isinstance(track_raw, (bytes, bytearray)) else str(track_raw)
+                            with self._track_cache_lock:
+                                entry = self._track_cache.get((camera_id, track_id))
+                                if entry is not None:
+                                    entry["best_crop_quality"] = quality
+                except Exception:
+                    pass
+
+        result = {
+            b"event_id":      fields.get(b"event_id", b""),
+            b"camera_id":     fields.get(b"camera_id",  b""),
+            b"track_id":      fields.get(b"track_id",   b""),
+            b"timestamp":     fields.get(b"timestamp",  b""),
+            b"identity":      cached["identity"].encode(),
+            b"identity_id":   cached["identity"].encode(),
+            b"confidence":    str(round(float(cached["confidence"]), 6)).encode(),
+            b"yaw":           str(round(cached["yaw"],   2)).encode(),
+            b"pitch":         str(round(cached["pitch"], 2)).encode(),
+            b"roll":          str(round(cached["roll"],  2)).encode(),
+            b"quality":       str(round(cached["quality"], 4)).encode(),
+            b"face_crop_key": face_crop_key,
+            b"cached":        b"1",
+        }
+        self._writer.write(result)
+        with self._stats_lock:
+            self._stats_frames += 1
+            identity = cached["identity"]
+            count, best = self._stats_identities.get(identity, (0, 0.0))
+            self._stats_identities[identity] = (count + 1, max(best, float(cached["confidence"])))
 
     # ------------------------------------------------------------------
     # Lifecycle

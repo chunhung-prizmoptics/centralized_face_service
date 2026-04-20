@@ -48,6 +48,9 @@ def parse_args():
     p.add_argument("--workers",         type=int,   default=cfg.WORKERS,          help=f"Parallel BatchWorker threads  [{cfg.WORKERS}]")
     p.add_argument("--decode-workers",  type=int,   default=cfg.DECODE_WORKERS,   help=f"CPU decode threads per worker  [{cfg.DECODE_WORKERS}]")
     p.add_argument("--result-maxlen",   type=int,   default=cfg.RESULT_MAXLEN,    help=f"Max result stream entries (0=unlimited)  [{cfg.RESULT_MAXLEN}]")
+    p.add_argument("--track-cache-ttl",             type=int, default=cfg.TRACK_CACHE_TTL,             help=f"Seconds before an idle track is evicted from the identity cache (0=disable)  [{cfg.TRACK_CACHE_TTL}]")
+    p.add_argument("--track-cache-recheck",         type=int, default=cfg.TRACK_CACHE_RECHECK,         help=f"Seconds before a cached known track is force-reinferred  [{cfg.TRACK_CACHE_RECHECK}]")
+    p.add_argument("--track-cache-unknown-recheck", type=int, default=cfg.TRACK_CACHE_UNKNOWN_RECHECK, help=f"Recheck interval (s) for Unknown tracks (0=same as --track-cache-recheck)  [{cfg.TRACK_CACHE_UNKNOWN_RECHECK}]")
     p.add_argument("--request-maxlen",  type=int,   default=cfg.REQUEST_MAXLEN,   help=f"Max request stream entries (0=unlimited)  [{cfg.REQUEST_MAXLEN}]")
     p.add_argument("--threshold",       type=float, default=cfg.MATCH_THRESHOLD,  help=f"Match cosine threshold  [{cfg.MATCH_THRESHOLD}]")
     p.add_argument("--det-size",        type=int,   default=cfg.DET_SIZE,         help=f"InsightFace detection size  [{cfg.DET_SIZE}]")
@@ -130,6 +133,7 @@ def main():
     logger.info(f"  GPU ID       : {args.gpu_id}")
     logger.info(f"  ReID         : {'disabled' if args.no_reid else 'enabled'}")
     logger.info(f"  Detection    : {'enabled (SCRFD)' if args.detect else 'disabled (landmark align)'}")
+    logger.info(f"  Track cache  : TTL={args.track_cache_ttl}s  recheck={args.track_cache_recheck}s  unknown_recheck={args.track_cache_unknown_recheck}s{'  (disabled)' if args.track_cache_ttl == 0 else ''}")
     logger.info(f"  API          : {'enabled' if args.api else 'disabled'}")
     if args.api:
         logger.info(f"  API bind     : http://{args.api_host}:{args.api_port}")
@@ -191,6 +195,9 @@ def main():
             no_reid=args.no_reid,
             run_detection=args.detect,
             decode_workers=args.decode_workers,
+            track_cache_ttl=args.track_cache_ttl,
+            track_cache_recheck=args.track_cache_recheck,
+            track_cache_unknown_recheck=args.track_cache_unknown_recheck,
         )
         w.name = f"BatchWorker-{i}"
         w.start()

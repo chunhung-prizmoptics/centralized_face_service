@@ -66,6 +66,30 @@ API_HOST    = os.getenv("API_HOST", "127.0.0.1")
 API_PORT    = int(os.getenv("API_PORT", "8000"))
 
 # -----------------------------------------------------------------------
+# Per-track identity cache
+# -----------------------------------------------------------------------
+# Once a track_id is confidently matched, subsequent frames for the same
+# (camera_id, track_id) skip GPU inference and re-publish the cached result.
+# This prevents wasteful repeated inference on stationary faces (e.g. someone
+# holding a photo in front of a camera) while still serving results to
+# downstream consumers for every frame.
+#
+# TRACK_CACHE_TTL: seconds of inactivity before a track entry is evicted.
+#   Set to reflect how long a person stays in frame (e.g. 30s).
+#   Set to 0 to disable caching entirely.
+TRACK_CACHE_TTL = int(os.getenv("TRACK_CACHE_TTL", "30"))
+
+# TRACK_CACHE_RECHECK: force a fresh inference after this many seconds even
+#   for cached tracks, to catch genuine identity changes (e.g. second person
+#   at same camera spot). Set to 0 to never force recheck.
+TRACK_CACHE_RECHECK = int(os.getenv("TRACK_CACHE_RECHECK", "10"))
+
+# TRACK_CACHE_UNKNOWN_RECHECK: recheck interval for tracks currently labelled
+#   Unknown. Shorter than TRACK_CACHE_RECHECK so a newly enrolled person is
+#   recognised promptly. Set to 0 to use the same interval as known identities.
+TRACK_CACHE_UNKNOWN_RECHECK = int(os.getenv("TRACK_CACHE_UNKNOWN_RECHECK", "3"))
+
+# -----------------------------------------------------------------------
 # Deadline filtering
 # -----------------------------------------------------------------------
 # Maximum age (ms) past deadline_ts_ms before a message is dropped.
