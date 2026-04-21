@@ -347,14 +347,31 @@ class BatchWorker(threading.Thread):
                     del self._track_cache[k]
 
     @staticmethod
-    def _estimate_quality(img: np.ndarray) -> float:
+    def _estimate_image_metrics(img: np.ndarray) -> dict:
         """
-        Estimate face image quality as a Laplacian variance score (blur detection).
-        Higher = sharper.  Normalized to [0, 1] with soft saturation at 500.
+        Compute all image-quality metrics in one pass over the decoded image.
+
+        Returns a dict with:
+          sharpness  – Laplacian variance normalised to [0, 1] (saturates at 500)
+          brightness – mean pixel intensity normalised to [0, 1]
+          dark_ratio – fraction of pixels with intensity < 40  (0 = no dark pixels)
+          face_size  – min width or height of the image in pixels
+          quality    – alias for sharpness (kept for backward compat)
         """
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        return round(min(lap_var / 500.0, 1.0), 4)
+        lap_var    = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        sharpness  = round(min(lap_var / 500.0, 1.0), 4)
+        brightness = round(float(gray.mean()) / 255.0, 4)
+        dark_ratio = round(float((gray < 40).sum()) / gray.size, 4)
+        h, w       = img.shape[:2]
+        face_size  = min(w, h)
+        return {
+            "sharpness":  sharpness,
+            "brightness": brightness,
+            "dark_ratio": dark_ratio,
+            "face_size":  face_size,
+            "quality":    sharpness,   # backward compat
+        }
 
     def _get_embedding_insightface(self, img: np.ndarray):
         """
@@ -655,15 +672,17 @@ class BatchWorker(threading.Thread):
         else:
             reid_emb = np.zeros(256, dtype=np.float32)
 
-        # Pose and quality — best-effort, never block publish on failure
+        # Pose and quality metrics — best-effort, never block publish on failure
         try:
             yaw, pitch, roll = self._estimate_pose(fields, pose_img if pose_img is not None else crop)
         except Exception:
             yaw, pitch, roll = 0.0, 0.0, 0.0
         try:
-            quality = self._estimate_quality(crop)
+            # Use original decoded crop for metrics so face_size reflects
+            # upstream crop dimensions (not always ArcFace's aligned 112x112).
+            metrics = self._estimate_image_metrics(pose_img if pose_img is not None else crop)
         except Exception:
-            quality = 0.0
+            metrics = {"sharpness": 0.0, "brightness": 0.0, "dark_ratio": 0.0, "face_size": 0, "quality": 0.0}
 
         # Store original crop as a short-lived Redis key for on-demand downstream access
         face_crop_key = ""
@@ -688,7 +707,11 @@ class BatchWorker(threading.Thread):
             b"yaw":            str(round(yaw,   2)).encode(),
             b"pitch":          str(round(pitch, 2)).encode(),
             b"roll":           str(round(roll,  2)).encode(),
-            b"quality":        str(round(quality, 4)).encode(),
+            b"quality":        str(metrics["quality"]).encode(),
+            b"sharpness":      str(metrics["sharpness"]).encode(),
+            b"brightness":     str(metrics["brightness"]).encode(),
+            b"dark_ratio":     str(metrics["dark_ratio"]).encode(),
+            b"face_size":      str(metrics["face_size"]).encode(),
             b"face_crop_key":  face_crop_key.encode(),
             # b"embedding":      json.dumps(embedding.tolist()).encode(),
             # b"reid_embedding": json.dumps(reid_emb.tolist()).encode(),
@@ -713,7 +736,11 @@ class BatchWorker(threading.Thread):
             "identity_id": identity_id,
             "confidence":  confidence,
             "yaw": yaw, "pitch": pitch, "roll": roll,
-            "quality": quality,
+            "quality":     metrics["quality"],
+            "sharpness":   metrics["sharpness"],
+            "brightness":  metrics["brightness"],
+            "dark_ratio":  metrics["dark_ratio"],
+            "face_size":   metrics["face_size"],
         })
 
     def _publish_cached(self, fields: dict, cached: dict):
@@ -733,13 +760,12 @@ class BatchWorker(threading.Thread):
                 try:
                     img = self._decode_jpeg(bytes(raw_jpeg))
                     if img is not None:
-                        quality = self._estimate_quality(img)
-                        # Only store if this frame is better than the cached best quality
-                        if quality > cached.get("best_crop_quality", 0.0):
+                        m = self._estimate_image_metrics(img)
+                        # Only store if this frame is sharper than the cached best
+                        if m["sharpness"] > cached.get("best_crop_quality", 0.0):
                             key = f"face_crop:{event_id}"
                             self._writer.set_key(key, bytes(raw_jpeg), self._face_crop_ttl)
                             face_crop_key = key.encode()
-                            # Update best quality in the cache (under lock)
                             cam_raw   = fields.get(b"camera_id") or fields.get("camera_id") or b""
                             track_raw = fields.get(b"track_id")  or fields.get("track_id")  or b""
                             camera_id = cam_raw.decode(errors="replace")   if isinstance(cam_raw,   (bytes, bytearray)) else str(cam_raw)
@@ -747,7 +773,7 @@ class BatchWorker(threading.Thread):
                             with self._track_cache_lock:
                                 entry = self._track_cache.get((camera_id, track_id))
                                 if entry is not None:
-                                    entry["best_crop_quality"] = quality
+                                    entry["best_crop_quality"] = m["sharpness"]
                 except Exception:
                     pass
 
@@ -762,7 +788,11 @@ class BatchWorker(threading.Thread):
             b"yaw":           str(round(cached["yaw"],   2)).encode(),
             b"pitch":         str(round(cached["pitch"], 2)).encode(),
             b"roll":          str(round(cached["roll"],  2)).encode(),
-            b"quality":       str(round(cached["quality"], 4)).encode(),
+            b"quality":       str(cached["quality"]).encode(),
+            b"sharpness":     str(cached["sharpness"]).encode(),
+            b"brightness":    str(cached["brightness"]).encode(),
+            b"dark_ratio":    str(cached["dark_ratio"]).encode(),
+            b"face_size":     str(cached["face_size"]).encode(),
             b"face_crop_key": face_crop_key,
             b"cached":        b"1",
         }
