@@ -193,6 +193,96 @@ class BatchWorker(threading.Thread):
         kps[:, 1] *= max(h - 1, 1)
         return kps
 
+    @staticmethod
+    def _has_eye_texture(kps: np.ndarray, img: np.ndarray,
+                         threshold: float = 15.0) -> bool:
+        """
+        Return True if at least one eye-landmark region has real eye texture.
+
+        Extracts a patch around each of the two eye landmarks (patch side =
+        30% of eye separation) and checks Laplacian variance.  Returns False
+        only when BOTH patches are below the threshold — meaning both look like
+        hair/skin rather than iris/sclera edges.  Using AND keeps the check
+        forgiving for profile faces where one eye may be partially occluded.
+        """
+        img_h, img_w = img.shape[:2]
+        left_eye, right_eye = kps[0], kps[1]
+        eye_sep = abs(right_eye[0] - left_eye[0])
+        half = max(int(eye_sep * 0.15), 4)
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        def _lap(cx: float, cy: float) -> float:
+            x0, y0 = max(int(cx) - half, 0), max(int(cy) - half, 0)
+            x1, y1 = min(int(cx) + half, img_w), min(int(cy) + half, img_h)
+            p = gray[y0:y1, x0:x1]
+            return float(cv2.Laplacian(p, cv2.CV_64F).var()) if p.size > 0 else 0.0
+
+        return _lap(*left_eye) >= threshold or _lap(*right_eye) >= threshold
+
+    @staticmethod
+    def _is_valid_landmark_geometry(kps: np.ndarray, img: np.ndarray,
+                                    eye_patch_lap_threshold: float = 15.0) -> bool:
+        """
+        Reject crops where the 5-point landmark set is anatomically impossible
+        OR where the eye-region texture indicates hair/skin rather than real eyes.
+
+        Two-stage check:
+
+        Stage 1 — Geometric ordering (fast, no pixels):
+          1. Nose Y > both eye Ys     (nose is below eyes in image coords)
+          2. Mouth Y > nose Y         (mouth is below nose)
+          3. Left eye X < right eye X (eyes not horizontally swapped)
+          4. Eye separation > 10% of image width
+
+        Stage 2 — Eye-region texture (catches back-of-head where geometry passes):
+          For each of the two eye landmarks, extract a square patch whose side
+          is 30% of eye separation (scales with crop size).  Compute Laplacian
+          variance on the grayscale patch.  Real eyes have high local contrast
+          (iris/sclera/eyelid edges).  Hair/skin at fake eye positions is
+          low-contrast uniform texture.
+          Reject if BOTH eye patches are below `eye_patch_lap_threshold`.
+          Using AND (both low) keeps the check conservative — profile faces may
+          have one partially occluded eye.
+        """
+        img_h, img_w = img.shape[:2]
+        left_eye, right_eye, nose, left_mouth, right_mouth = kps
+
+        # --- Stage 1: geometric ordering ---
+        if nose[1] <= left_eye[1] or nose[1] <= right_eye[1]:
+            return False
+        mouth_y = (left_mouth[1] + right_mouth[1]) / 2.0
+        if mouth_y <= nose[1]:
+            return False
+        if left_eye[0] >= right_eye[0]:
+            return False
+        eye_sep = right_eye[0] - left_eye[0]
+        if eye_sep < 0.10 * img_w:
+            return False
+
+        # --- Stage 2: eye-region texture ---
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        half = max(int(eye_sep * 0.15), 4)  # half-side of patch
+
+        def _patch_lap_var(cx: float, cy: float) -> float:
+            x0 = max(int(cx) - half, 0)
+            y0 = max(int(cy) - half, 0)
+            x1 = min(int(cx) + half, img_w)
+            y1 = min(int(cy) + half, img_h)
+            patch = gray[y0:y1, x0:x1]
+            if patch.size == 0:
+                return 0.0
+            return float(cv2.Laplacian(patch, cv2.CV_64F).var())
+
+        left_lap  = _patch_lap_var(left_eye[0],  left_eye[1])
+        right_lap = _patch_lap_var(right_eye[0], right_eye[1])
+
+        # Reject only if BOTH patches are below threshold (conservative)
+        if left_lap < eye_patch_lap_threshold and right_lap < eye_patch_lap_threshold:
+            return False
+
+        return True
+
     def _align_crop(self, img: np.ndarray, fields: dict) -> np.ndarray:
         """
         Align a decoded face crop to 112×112 for ArcFace.
@@ -684,37 +774,55 @@ class BatchWorker(threading.Thread):
         except Exception:
             metrics = {"sharpness": 0.0, "brightness": 0.0, "dark_ratio": 0.0, "face_size": 0, "quality": 0.0}
 
-        # Store original crop as a short-lived Redis key for on-demand downstream access
+        # Store original crop as a short-lived Redis key for on-demand downstream access.
+        # For Unknown results: only store if eye-region texture looks like real eyes
+        # (not back-of-head hair/skin at fake landmark positions).
         face_crop_key = ""
         if self._face_crop_ttl > 0 and event_id:
             raw_jpeg = fields.get(b"face_crop_jpeg") or fields.get("face_crop_jpeg")
             if raw_jpeg:
-                try:
-                    face_crop_key = f"face_crop:{event_id}"
-                    self._writer.set_key(face_crop_key, bytes(raw_jpeg), self._face_crop_ttl)
-                except Exception as exc:
-                    logger.warning(f"[{event_id}] Failed to store face_crop key: {exc}")
-                    face_crop_key = ""
+                store_crop = True
+                if identity == "Unknown":
+                    kps = self._parse_landmarks(fields, pose_img if pose_img is not None else crop)
+                    if kps is not None and not self._has_eye_texture(kps, pose_img if pose_img is not None else crop):
+                        store_crop = False
+                        logger.debug(f"[{event_id}] Unknown: skipping crop storage — no eye texture (likely back-of-head).")
+                if store_crop:
+                    try:
+                        face_crop_key = f"face_crop:{event_id}"
+                        self._writer.set_key(face_crop_key, bytes(raw_jpeg), self._face_crop_ttl)
+                    except Exception as exc:
+                        logger.warning(f"[{event_id}] Failed to store face_crop key: {exc}")
+                        face_crop_key = ""
+
+        # Pass through the crop-local normalized landmarks so downstream can call
+        # /faces/register_from_crop directly without re-running detection.
+        landmark_passthrough = (
+            fields.get(b"landmark_5_xy_crop") or fields.get("landmark_5_xy_crop") or b""
+        )
+        if isinstance(landmark_passthrough, str):
+            landmark_passthrough = landmark_passthrough.encode()
 
         result = {
-            b"event_id":       fields.get(b"event_id", b""),
-            b"camera_id":      fields.get(b"camera_id",  b""),
-            b"track_id":       fields.get(b"track_id",   b""),
-            b"timestamp":      fields.get(b"timestamp",  b""),
-            b"identity":       identity.encode(),
-            b"identity_id":    identity.encode(),   # DEBUG: name instead of UUID for easy tracing
-            b"confidence":     str(round(float(confidence), 6)).encode(),
-            b"yaw":            str(round(yaw,   2)).encode(),
-            b"pitch":          str(round(pitch, 2)).encode(),
-            b"roll":           str(round(roll,  2)).encode(),
-            b"quality":        str(metrics["quality"]).encode(),
-            b"sharpness":      str(metrics["sharpness"]).encode(),
-            b"brightness":     str(metrics["brightness"]).encode(),
-            b"dark_ratio":     str(metrics["dark_ratio"]).encode(),
-            b"face_size":      str(metrics["face_size"]).encode(),
-            b"face_crop_key":  face_crop_key.encode(),
-            # b"embedding":      json.dumps(embedding.tolist()).encode(),
-            # b"reid_embedding": json.dumps(reid_emb.tolist()).encode(),
+            b"event_id":          fields.get(b"event_id", b""),
+            b"camera_id":         fields.get(b"camera_id",  b""),
+            b"track_id":          fields.get(b"track_id",   b""),
+            b"timestamp":         fields.get(b"timestamp",  b""),
+            b"identity":          identity.encode(),
+            b"identity_id":       identity.encode(),   # DEBUG: name instead of UUID for easy tracing
+            b"confidence":        str(round(float(confidence), 6)).encode(),
+            b"yaw":               str(round(yaw,   2)).encode(),
+            b"pitch":             str(round(pitch, 2)).encode(),
+            b"roll":              str(round(roll,  2)).encode(),
+            b"quality":           str(metrics["quality"]).encode(),
+            b"sharpness":         str(metrics["sharpness"]).encode(),
+            b"brightness":        str(metrics["brightness"]).encode(),
+            b"dark_ratio":        str(metrics["dark_ratio"]).encode(),
+            b"face_size":         str(metrics["face_size"]).encode(),
+            b"face_crop_key":     face_crop_key.encode(),
+            b"landmark_5_xy_crop": landmark_passthrough,
+            # b"embedding":         json.dumps(embedding.tolist()).encode(),
+            # b"reid_embedding":    json.dumps(reid_emb.tolist()).encode(),
         }
         self._writer.write(result)
         with self._stats_lock:
@@ -732,15 +840,16 @@ class BatchWorker(threading.Thread):
         camera_id = cam_raw.decode(errors="replace")   if isinstance(cam_raw,   (bytes, bytearray)) else str(cam_raw)
         track_id  = track_raw.decode(errors="replace") if isinstance(track_raw, (bytes, bytearray)) else str(track_raw)
         self._track_cache_put(camera_id, track_id, time.monotonic(), {
-            "identity":    identity,
-            "identity_id": identity_id,
-            "confidence":  confidence,
+            "identity":          identity,
+            "identity_id":       identity_id,
+            "confidence":        confidence,
             "yaw": yaw, "pitch": pitch, "roll": roll,
-            "quality":     metrics["quality"],
-            "sharpness":   metrics["sharpness"],
-            "brightness":  metrics["brightness"],
-            "dark_ratio":  metrics["dark_ratio"],
-            "face_size":   metrics["face_size"],
+            "quality":           metrics["quality"],
+            "sharpness":         metrics["sharpness"],
+            "brightness":        metrics["brightness"],
+            "dark_ratio":        metrics["dark_ratio"],
+            "face_size":         metrics["face_size"],
+            "landmark_5_xy_crop": landmark_passthrough.decode(errors="replace") if landmark_passthrough else "",
         })
 
     def _publish_cached(self, fields: dict, cached: dict):
@@ -777,24 +886,31 @@ class BatchWorker(threading.Thread):
                 except Exception:
                     pass
 
+        # Re-use the landmark that was cached alongside the identity so downstream
+        # still has it available for register_from_crop on cached frames.
+        cached_landmark = cached.get("landmark_5_xy_crop", "")
+        if isinstance(cached_landmark, str):
+            cached_landmark = cached_landmark.encode()
+
         result = {
-            b"event_id":      fields.get(b"event_id", b""),
-            b"camera_id":     fields.get(b"camera_id",  b""),
-            b"track_id":      fields.get(b"track_id",   b""),
-            b"timestamp":     fields.get(b"timestamp",  b""),
-            b"identity":      cached["identity"].encode(),
-            b"identity_id":   cached["identity"].encode(),
-            b"confidence":    str(round(float(cached["confidence"]), 6)).encode(),
-            b"yaw":           str(round(cached["yaw"],   2)).encode(),
-            b"pitch":         str(round(cached["pitch"], 2)).encode(),
-            b"roll":          str(round(cached["roll"],  2)).encode(),
-            b"quality":       str(cached["quality"]).encode(),
-            b"sharpness":     str(cached["sharpness"]).encode(),
-            b"brightness":    str(cached["brightness"]).encode(),
-            b"dark_ratio":    str(cached["dark_ratio"]).encode(),
-            b"face_size":     str(cached["face_size"]).encode(),
-            b"face_crop_key": face_crop_key,
-            b"cached":        b"1",
+            b"event_id":          fields.get(b"event_id", b""),
+            b"camera_id":         fields.get(b"camera_id",  b""),
+            b"track_id":          fields.get(b"track_id",   b""),
+            b"timestamp":         fields.get(b"timestamp",  b""),
+            b"identity":          cached["identity"].encode(),
+            b"identity_id":       cached["identity"].encode(),
+            b"confidence":        str(round(float(cached["confidence"]), 6)).encode(),
+            b"yaw":               str(round(cached["yaw"],   2)).encode(),
+            b"pitch":             str(round(cached["pitch"], 2)).encode(),
+            b"roll":              str(round(cached["roll"],  2)).encode(),
+            b"quality":           str(cached["quality"]).encode(),
+            b"sharpness":         str(cached["sharpness"]).encode(),
+            b"brightness":        str(cached["brightness"]).encode(),
+            b"dark_ratio":        str(cached["dark_ratio"]).encode(),
+            b"face_size":         str(cached["face_size"]).encode(),
+            b"face_crop_key":     face_crop_key,
+            b"landmark_5_xy_crop": cached_landmark,
+            b"cached":            b"1",
         }
         self._writer.write(result)
         with self._stats_lock:

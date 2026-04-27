@@ -20,6 +20,7 @@ import os
 os.environ.setdefault("PYTHONNOUSERSITE", "1")
 
 import io
+import json
 import threading
 import time
 import uuid
@@ -30,6 +31,7 @@ import cv2
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from insightface.utils import face_align
 from loguru import logger
 
 from face_db import FaceDatabase
@@ -168,6 +170,121 @@ def _extract_embeddings(image_bytes: bytes) -> tuple[list, list[dict]]:
     return selected, diagnostics
 
 
+def _parse_landmarks_for_crop(raw: str, img_w: int, img_h: int) -> np.ndarray:
+    """
+    Parse 5-point landmarks and return absolute pixel coordinates in crop space.
+
+    Accepts either:
+      1. JSON: [[x0,y0],...,[x4,y4]]
+      2. CSV:  x0,y0,x1,y1,...,x4,y4
+
+    Coordinates may be normalized [0..1] or absolute crop pixels.
+    """
+    if raw is None or str(raw).strip() == "":
+        raise ValueError("landmark_5_xy is required.")
+
+    kps = None
+    text = str(raw).strip()
+
+    try:
+        kps = np.array(json.loads(text), dtype=np.float32).reshape(5, 2)
+    except Exception:
+        pass
+
+    if kps is None:
+        try:
+            vals = [float(v.strip()) for v in text.split(",")]
+            if len(vals) != 10:
+                raise ValueError("landmark_5_xy must contain exactly 10 numeric values.")
+            kps = np.array(vals, dtype=np.float32).reshape(5, 2)
+        except Exception as exc:
+            raise ValueError(f"Invalid landmark_5_xy format: {exc}")
+
+    # Auto-detect normalized input.
+    if float(np.max(kps)) <= 1.5:
+        kps[:, 0] *= max(img_w - 1, 1)
+        kps[:, 1] *= max(img_h - 1, 1)
+
+    # Clamp into image bounds.
+    kps[:, 0] = np.clip(kps[:, 0], 0, max(img_w - 1, 0))
+    kps[:, 1] = np.clip(kps[:, 1], 0, max(img_h - 1, 0))
+    return kps.astype(np.float32)
+
+
+def _landmark_geometry_ok(kps: np.ndarray, img_w: int, img_h: int) -> bool:
+    """Conservative geometry checks to reject obviously invalid landmark sets."""
+    if kps.shape != (5, 2):
+        return False
+
+    left_eye, right_eye, nose, left_mouth, right_mouth = kps
+    if left_eye[0] >= right_eye[0]:
+        return False
+
+    if nose[1] <= left_eye[1] or nose[1] <= right_eye[1]:
+        return False
+
+    mouth_y = (left_mouth[1] + right_mouth[1]) / 2.0
+    if mouth_y <= nose[1]:
+        return False
+
+    eye_sep = right_eye[0] - left_eye[0]
+    if eye_sep < 0.08 * float(max(img_w, 1)):
+        return False
+
+    if not np.isfinite(kps).all():
+        return False
+
+    return True
+
+
+def _extract_embedding_from_crop(image_bytes: bytes, landmark_5_xy: str) -> tuple[np.ndarray, dict]:
+    """
+    Build one ArcFace embedding from a pre-cropped face using provided 5-point landmarks.
+    This path intentionally skips face detection to avoid failures on tight crops.
+    """
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Cannot decode image – unsupported format or corrupt file.")
+
+    img_h, img_w = img.shape[:2]
+    if img_h < 24 or img_w < 24:
+        raise ValueError("Face crop is too small for reliable embedding extraction.")
+
+    kps = _parse_landmarks_for_crop(landmark_5_xy, img_w, img_h)
+    if not _landmark_geometry_ok(kps, img_w, img_h):
+        raise ValueError("Invalid facial landmark geometry for this crop.")
+
+    aligned = face_align.norm_crop(img, landmark=kps)
+
+    rec_model = _face_app.models.get("recognition") if _face_app is not None else None
+    if rec_model is None:
+        raise ValueError("Recognition model is not available.")
+
+    with _model_lock:
+        emb = rec_model.get_feat(aligned[np.newaxis])
+    emb = np.array(emb).flatten().astype(np.float32)
+
+    emb_norm = float(np.linalg.norm(emb))
+    if emb.size == 0 or emb_norm < 1e-3:
+        raise ValueError("Generated embedding is degenerate and cannot be used for recognition.")
+
+    gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    brightness = float(gray.mean())
+    dark_ratio = float((gray < 40).mean())
+
+    diagnostics = {
+        "aligned_size": [int(aligned.shape[1]), int(aligned.shape[0])],
+        "embedding_dim": int(emb.shape[0]),
+        "embedding_norm": round(emb_norm, 6),
+        "sharpness": round(sharpness, 2),
+        "brightness": round(brightness, 2),
+        "dark_ratio": round(dark_ratio, 4),
+    }
+    return emb, diagnostics
+
+
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
@@ -220,6 +337,62 @@ async def register_face(
         "timestamp": _now_iso(),
         "warnings": warnings,
         "quality_reports": quality_reports,
+    }
+
+
+@app.post("/faces/register_from_crop")
+async def register_from_crop(
+    name: str = Form(..., description="Identity name"),
+    landmark_5_xy: str = Form(
+        ...,
+        description=(
+            "5-point facial landmarks for this crop; JSON [[x,y]x5] or CSV x0,y0,...,x4,y4. "
+            "Supports normalized [0..1] or absolute crop pixels."
+        ),
+    ),
+    id: str = Form(None, description="Optional UUID for this identity. A new UUID is generated if omitted."),
+    file: UploadFile = File(..., description="One pre-cropped face image."),
+):
+    """
+    Register identity from a tight crop + landmarks without running detector.
+    This avoids detector misses on tightly cropped faces.
+    """
+    if _face_db is None:
+        raise HTTPException(503, "Face DB not initialized.")
+
+    if id is not None:
+        try:
+            identity_id = str(uuid.UUID(id))
+        except ValueError:
+            raise HTTPException(400, f"Invalid UUID format: '{id}'.")
+    else:
+        identity_id = str(uuid.uuid4())
+
+    try:
+        data = await file.read()
+        emb, diagnostics = _extract_embedding_from_crop(data, landmark_5_xy)
+    except Exception as exc:
+        raise HTTPException(400, f"register_from_crop failed: {exc}")
+
+    success = _face_db.register_identity(name, [emb], identity_id=identity_id)
+    if not success:
+        raise HTTPException(
+            409,
+            f"Identity '{name}' already exists. Use POST /faces/update to modify it.",
+        )
+
+    return {
+        "success": True,
+        "message": f"Identity '{name}' registered from crop.",
+        "name": name,
+        "id": identity_id,
+        "embeddings_added": 1,
+        "timestamp": _now_iso(),
+        "quality_report": {
+            "file": file.filename,
+            "mode": "landmark_aligned_crop",
+            "diagnostics": diagnostics,
+        },
     }
 
 

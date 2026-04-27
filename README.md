@@ -170,16 +170,17 @@ Stream: `face_inference:results`
 | `yaw`            | string | Head yaw in degrees (positive = face turned right). `0.0` if no landmarks. |
 | `pitch`          | string | Head pitch in degrees (positive = face tilted up). `0.0` if no landmarks.  |
 | `roll`           | string | Head roll in degrees (positive = face tilted clockwise). `0.0` if no landmarks. |
-| `quality`        | string | Sharpness score (float, 0–1). Laplacian variance, saturates at 500. `1.0` = very sharp. |
-| `embedding`      | JSON   | 512-D ArcFace embedding as a JSON float array                               |
-| `reid_embedding` | JSON   | 256-D ReID embedding (all-zeros if `--no-reid`)                             |
+| `quality`             | string | Sharpness score (float, 0–1). Laplacian variance, saturates at 500. `1.0` = very sharp. |
+| `landmark_5_xy_crop`  | string | 5-point landmarks echoed from the request (crop-local normalized [0..1], CSV `x0,y0,...,x4,y4`). Empty string when not supplied by upstream producer. Pass directly to `POST /faces/register_from_crop` when enrolling an Unknown person. |
+| `embedding`           | JSON   | 512-D ArcFace embedding as a JSON float array (commented out by default)    |
+| `reid_embedding`      | JSON   | 256-D ReID embedding (all-zeros if `--no-reid`)                             |
 
 ---
 
 ## Face Enrollment API
 
-The enrollment API lets you register or remove identities at runtime without
-restarting the service.
+The enrollment API lets you register, update, list, and remove identities at runtime
+without restarting the service.
 
 Run it together with the inference service (same process, shared in-memory DB):
 
@@ -196,46 +197,83 @@ conda run -n face_rtsp_env python face_api.py \
 
 Interactive docs: `http://localhost:8000/docs`
 
-### Register a face
+### Exposed endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/faces/register` | Register a new identity from one or more photos (detector-based). |
+| `POST` | `/faces/register_from_crop` | Register a new identity from one tight face crop + 5-point landmarks (detector-free alignment). |
+| `POST` | `/faces/update` | Append or replace embeddings for an existing identity. |
+| `DELETE` | `/faces/{name}` | Delete an identity by name. |
+| `GET` | `/faces` | List registered identities. |
+| `GET` | `/health` | Health check. |
+
+### Register from normal photos (`/faces/register`)
 
 ```bash
 # Auto-generate identity UUID
 curl -X POST http://localhost:8000/faces/register \
   -F "name=Alice" \
-  -F "file=@alice.jpg"
+  -F "files=@alice_1.jpg" \
+  -F "files=@alice_2.jpg"
 
 # Provide your own UUID (useful for linking to an external system)
 curl -X POST http://localhost:8000/faces/register \
   -F "name=Alice" \
   -F "id=550e8400-e29b-41d4-a716-446655440000" \
-  -F "file=@alice.jpg"
+  -F "files=@alice_1.jpg"
 ```
 
-Response:
-```json
-{ "name": "Alice", "id": "550e8400-e29b-41d4-a716-446655440000", "embeddings_added": 1 }
+### Register from tight crop + landmarks (`/faces/register_from_crop`)
+
+Use this path when detector-based enrollment is unreliable on tight crops.
+`landmark_5_xy` accepts either JSON (`[[x,y], ...]`) or CSV (`x0,y0,...,x4,y4`),
+in normalized `[0..1]` or absolute crop pixels.
+
+```bash
+# CSV landmarks (left_eye,right_eye,nose,left_mouth,right_mouth)
+curl -X POST http://localhost:8000/faces/register_from_crop \
+  -F "name=Alice" \
+  -F "landmark_5_xy=0.32,0.40,0.67,0.41,0.50,0.58,0.38,0.74,0.63,0.75" \
+  -F "file=@alice_tight_crop.jpg"
+
+# JSON landmarks + explicit UUID
+curl -X POST http://localhost:8000/faces/register_from_crop \
+  -F "name=Alice" \
+  -F "id=550e8400-e29b-41d4-a716-446655440000" \
+  -F 'landmark_5_xy=[[0.32,0.40],[0.67,0.41],[0.50,0.58],[0.38,0.74],[0.63,0.75]]' \
+  -F "file=@alice_tight_crop.jpg"
 ```
 
-### List identities
+### Update an identity (`/faces/update`)
+
+```bash
+# Append embeddings
+curl -X POST http://localhost:8000/faces/update \
+  -F "name=Alice" \
+  -F "mode=append" \
+  -F "files=@alice_new_1.jpg"
+
+# Replace all stored embeddings
+curl -X POST http://localhost:8000/faces/update \
+  -F "name=Alice" \
+  -F "mode=replace" \
+  -F "files=@alice_replacement.jpg"
+```
+
+### List identities (`/faces`)
 
 ```bash
 curl http://localhost:8000/faces
 ```
 
-```json
-[
-  { "name": "Alice", "id": "550e8400-e29b-41d4-a716-446655440000", "count": 2 },
-  { "name": "Bob",   "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7", "count": 1 }
-]
-```
-
-### Delete an identity
+### Delete an identity (`/faces/{name}`)
 
 ```bash
 curl -X DELETE http://localhost:8000/faces/Alice
 ```
 
-### Health check
+### Health check (`/health`)
 
 ```bash
 curl http://localhost:8000/health

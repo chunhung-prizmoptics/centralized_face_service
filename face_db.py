@@ -358,6 +358,7 @@ class FaceDatabase:
                 return False
             del self._identities[name]
         self._delete_from_cache(name)
+        self._delete_from_manifest(name)
         logger.info(f"Deleted identity: '{name}'")
         return True
 
@@ -398,6 +399,14 @@ class FaceDatabase:
     def _delete_from_cache(self, name: str):
         """Remove one identity then rewrite the cache."""
         self._save_cache()
+
+    def _delete_from_manifest(self, name: str):
+        """Remove one identity from the manifest so build_from_gallery re-processes it on restart."""
+        manifest = self._load_manifest()
+        if name in manifest:
+            del manifest[name]
+            self._save_manifest(manifest)
+            logger.debug(f"Manifest: removed '{name}' so next restart re-processes gallery folder.")
 
     def _load_cache(self) -> int:
         if not self._cache_path or not Path(self._cache_path).exists():
