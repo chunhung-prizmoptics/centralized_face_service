@@ -255,14 +255,31 @@ def _extract_embedding_from_crop(image_bytes: bytes, landmark_5_xy: str) -> tupl
     if not _landmark_geometry_ok(kps, img_w, img_h):
         raise ValueError("Invalid facial landmark geometry for this crop.")
 
-    aligned = face_align.norm_crop(img, landmark=kps)
+    logger.debug(
+        f"norm_crop input | img.shape={img.shape} "
+        f"kps={kps.tolist()}"
+    )
+
+    try:
+        aligned = face_align.norm_crop(img, landmark=kps)
+    except Exception as exc:
+        raise ValueError(
+            f"norm_crop failed — likely degenerate landmark positions for this crop size. "
+            f"img.shape={img.shape} kps={kps.tolist()} error={exc}"
+        )
+
+    if aligned is None or aligned.size == 0 or aligned.shape[:2] != (112, 112):
+        raise ValueError(
+            f"norm_crop returned unexpected shape {getattr(aligned, 'shape', None)} — "
+            f"img.shape={img.shape} kps={kps.tolist()}"
+        )
 
     rec_model = _face_app.models.get("recognition") if _face_app is not None else None
     if rec_model is None:
         raise ValueError("Recognition model is not available.")
 
     with _model_lock:
-        emb = rec_model.get_feat(aligned[np.newaxis])
+        emb = rec_model.get_feat([aligned])  # pass as list, same as batch path in inference worker
     emb = np.array(emb).flatten().astype(np.float32)
 
     emb_norm = float(np.linalg.norm(emb))
@@ -357,6 +374,8 @@ async def register_from_crop(
     Register identity from a tight crop + landmarks without running detector.
     This avoids detector misses on tightly cropped faces.
     """
+    logger.debug(f"POST /faces/register_from_crop received | name={name!r} id={id!r} file={file.filename!r} landmark={landmark_5_xy!r}")
+
     if _face_db is None:
         raise HTTPException(503, "Face DB not initialized.")
 
