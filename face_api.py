@@ -20,11 +20,13 @@ import os
 os.environ.setdefault("PYTHONNOUSERSITE", "1")
 
 import io
+import shutil
 import json
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List
 
 import cv2
@@ -42,6 +44,7 @@ app = FastAPI(title="Face Recognition Enrollment API", version="1.0.0")
 _face_db: FaceDatabase = None
 _face_app = None
 _model_lock = threading.Lock()  # shared with realtime_face_recognition.py
+_gallery_dir: str = None  # gallery is the single source of truth
 
 # Y-axis aligned to image coordinates (downward-positive) for solvePnP consistency.
 _FACE_3D_MODEL = np.array([
@@ -57,12 +60,14 @@ def init_api(
     face_db: FaceDatabase,
     face_app,
     model_lock: threading.Lock = None,
+    gallery_dir: str = None,
 ):
-    global _face_db, _face_app, _model_lock
+    global _face_db, _face_app, _model_lock, _gallery_dir
     _face_db = face_db
     _face_app = face_app
     if model_lock is not None:
         _model_lock = model_lock
+    _gallery_dir = gallery_dir
 
 
 # ------------------------------------------------------------------
@@ -71,6 +76,67 @@ def init_api(
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _save_to_gallery(name: str, filename: str, data: bytes) -> Path | None:
+    """
+    Write an uploaded image into gallery/<name>/<filename>.
+    Creates the folder if it does not exist.
+    Returns the written path, or None if gallery_dir is not configured.
+    Auto-deduplicates filename with a counter suffix if it already exists.
+    """
+    if not _gallery_dir:
+        return None
+    folder = Path(_gallery_dir) / name
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / filename
+    # Avoid silently overwriting: append _1, _2 … if name collision
+    if dest.exists():
+        stem, suffix = dest.stem, dest.suffix
+        counter = 1
+        while dest.exists():
+            dest = folder / f"{stem}_{counter}{suffix}"
+            counter += 1
+    dest.write_bytes(data)
+    logger.debug(f"Gallery: saved '{dest}'")
+    return dest
+
+
+def _resolve_gallery_key(name: str, identity_id: str = None) -> str:
+    """Resolve gallery folder key. Prefer UUID identity_id; fallback to DB lookup, then name."""
+    if identity_id:
+        return identity_id
+    if _face_db is not None:
+        try:
+            found_id = _face_db.get_identity_id(name)
+            if found_id:
+                return found_id
+        except Exception:
+            pass
+    return name
+
+
+def _delete_from_gallery(name: str):
+    """Remove gallery/<name>/ folder entirely when an identity is deleted via API."""
+    if not _gallery_dir:
+        return
+    folder = Path(_gallery_dir) / name
+    if folder.exists() and folder.is_dir():
+        shutil.rmtree(folder)
+        logger.info(f"Gallery: removed folder '{folder}' for deleted identity '{name}'")
+
+
+def _clear_gallery_images(name: str):
+    """Remove all images inside gallery/<name>/ without deleting the folder (for replace mode)."""
+    if not _gallery_dir:
+        return
+    folder = Path(_gallery_dir) / name
+    if not folder.exists():
+        return
+    for p in folder.iterdir():
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+            p.unlink()
+    logger.debug(f"Gallery: cleared images in '{folder}' (replace mode)")
 
 
 def _estimate_pose_from_kps(kps: np.ndarray, img_w: int, img_h: int) -> tuple[float, float, float]:
@@ -325,6 +391,19 @@ async def register_face(
     else:
         identity_id = str(uuid.uuid4())
 
+    gallery_key = _resolve_gallery_key(name, identity_id)
+    # If the provided name is already a UUID, treat it as canonical identity ID
+    # to keep folder and identity_id aligned.
+    try:
+        name_uuid = str(uuid.UUID(name))
+        if identity_id != name_uuid:
+            logger.warning(
+                f"register: name UUID '{name_uuid}' overrides provided id '{identity_id}'"
+            )
+            identity_id = name_uuid
+    except ValueError:
+        pass
+
     embeddings, warnings, quality_reports = [], [], []
     for f in files:
         try:
@@ -332,6 +411,7 @@ async def register_face(
             embs, diag = _extract_embeddings(data)
             embeddings.extend(embs)
             quality_reports.append({"file": f.filename, "faces": diag})
+            _save_to_gallery(gallery_key, f.filename or "image.jpg", data)
         except Exception as exc:
             warnings.append(f"{f.filename}: {exc}")
 
@@ -387,6 +467,20 @@ async def register_from_crop(
     else:
         identity_id = str(uuid.uuid4())
 
+    # If the provided name is already a UUID, treat it as canonical identity ID
+    # to keep folder and identity_id aligned.
+    try:
+        name_uuid = str(uuid.UUID(name))
+        if identity_id != name_uuid:
+            logger.warning(
+                f"register_from_crop: name UUID '{name_uuid}' overrides provided id '{identity_id}'"
+            )
+            identity_id = name_uuid
+    except ValueError:
+        pass
+
+    gallery_key = _resolve_gallery_key(name, identity_id)
+
     try:
         data = await file.read()
         emb, diagnostics = _extract_embedding_from_crop(data, landmark_5_xy)
@@ -399,6 +493,8 @@ async def register_from_crop(
             409,
             f"Identity '{name}' already exists. Use POST /faces/update to modify it.",
         )
+
+    _save_to_gallery(gallery_key, file.filename or "crop.jpg", data)
 
     return {
         "success": True,
@@ -427,6 +523,10 @@ async def update_face(
     if mode not in ("append", "replace"):
         raise HTTPException(400, "mode must be 'append' or 'replace'.")
 
+    gallery_key = _resolve_gallery_key(name)
+    if mode == "replace":
+        _clear_gallery_images(gallery_key)
+
     embeddings, warnings, quality_reports = [], [], []
     for f in files:
         try:
@@ -434,6 +534,7 @@ async def update_face(
             embs, diag = _extract_embeddings(data)
             embeddings.extend(embs)
             quality_reports.append({"file": f.filename, "faces": diag})
+            _save_to_gallery(gallery_key, f.filename or "image.jpg", data)
         except Exception as exc:
             warnings.append(f"{f.filename}: {exc}")
 
@@ -455,11 +556,13 @@ async def update_face(
 
 @app.delete("/faces/{name}")
 async def delete_face(name: str):
-    """Remove an identity from the database."""
+    """Remove an identity from the database and its gallery folder."""
     if _face_db is None:
         raise HTTPException(503, "Face DB not initialized.")
+    gallery_key = _resolve_gallery_key(name)
     if not _face_db.delete_identity(name):
         raise HTTPException(404, f"Identity '{name}' not found.")
+    _delete_from_gallery(gallery_key)
     return {
         "success": True,
         "message": f"Identity '{name}' deleted.",
@@ -496,9 +599,10 @@ def start_api_server(
     model_lock: threading.Lock,
     host: str = "127.0.0.1",
     port: int = 8000,
+    gallery_dir: str = None,
 ):
     """Start the enrollment API in a background daemon thread."""
-    init_api(face_db, face_app, model_lock)
+    init_api(face_db, face_app, model_lock, gallery_dir=gallery_dir)
 
     def _run():
         uvicorn.run(app, host=host, port=port, log_level="warning")
@@ -547,7 +651,6 @@ if __name__ == "__main__":
     logger.info("InsightFace ready.")
 
     face_db = FaceDatabase(cache_path="face_db_cache.npz")
-    from pathlib import Path
     gallery = Path(args.gallery)
     if gallery.exists():
         n = face_db.build_from_gallery(str(gallery), face_app=face_app, dedup_threshold=0.75)
@@ -556,7 +659,7 @@ if __name__ == "__main__":
         logger.warning(f"Gallery '{args.gallery}' not found – starting with empty DB.")
 
     model_lock = threading.Lock()
-    init_api(face_db, face_app, model_lock)
+    init_api(face_db, face_app, model_lock, gallery_dir=str(gallery))
 
     logger.info(f"Starting Face Enrollment API on http://{args.host}:{args.port} (docs: /docs)")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

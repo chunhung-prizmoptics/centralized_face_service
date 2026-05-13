@@ -43,6 +43,24 @@ class FaceDatabase:
         norm = np.linalg.norm(emb)
         return emb / (norm + 1e-8)
 
+    @staticmethod
+    def _id_for_name(name: str, manifest: dict) -> str:
+        """
+        Resolve a stable identity ID for a gallery folder:
+          1. If the folder name is itself a valid UUID, use it directly.
+          2. Otherwise use the ID already stored in the manifest.
+          3. Otherwise generate a fresh random UUID.
+        This guarantees folder UUIDs are authoritative and prevents legacy
+        manifest mappings from pinning a different ID to that folder.
+        """
+        try:
+            return str(uuid.UUID(name))
+        except ValueError:
+            stored = manifest.get(name, {}).get("__id__")
+            if stored:
+                return stored
+            return str(uuid.uuid4())
+
     def _store_identity(self, name: str, embeddings: np.ndarray, identity_id: str = None):
         """Store normalized embeddings and rebuild prototype. Caller may hold lock."""
         with self._lock:
@@ -85,7 +103,7 @@ class FaceDatabase:
         with self._lock:
             for name, data in self._identities.items():
                 if "id" not in data or not data["id"]:
-                    data["id"] = manifest.get(name, {}).get("__id__") or str(uuid.uuid4())
+                    data["id"] = self._id_for_name(name, manifest)
 
     # ------------------------------------------------------------------
     # Manifest helpers (cache diff)
@@ -174,6 +192,7 @@ class FaceDatabase:
         gallery_names = set()
         loaded = 0
         merged = 0
+        id_repaired = 0
 
         for person_dir in sorted(gallery.iterdir()):
             if not person_dir.is_dir():
@@ -185,9 +204,28 @@ class FaceDatabase:
             folder_mtime = self._folder_mtime(person_dir)
             cached_entry = manifest.get(name, {})
             if cached_entry.get("__folder_mtime__") == folder_mtime:
-                # Folder unchanged since last build — copy entry to new manifest and skip
-                new_manifest[name] = cached_entry
-                continue
+                # Folder unchanged since last build — copy entry to new manifest and skip,
+                # BUT only if the identity was actually loaded into memory from cache.
+                # If the cache is missing this identity (e.g. it was previously skipped due
+                # to no detected faces, or the .npz was stale), fall through and re-extract.
+                with self._lock:
+                    identity_in_memory = name in self._identities
+                if identity_in_memory:
+                    # Self-heal stale manifest IDs: UUID folder names are authoritative.
+                    canonical_id = self._id_for_name(name, manifest)
+                    if cached_entry.get("__id__") != canonical_id:
+                        fixed_entry = dict(cached_entry)
+                        fixed_entry["__id__"] = canonical_id
+                        new_manifest[name] = fixed_entry
+                        id_repaired += 1
+                        logger.info(
+                            f"  '{name}': repaired manifest id "
+                            f"{cached_entry.get('__id__')} -> {canonical_id}."
+                        )
+                    else:
+                        new_manifest[name] = cached_entry
+                    continue
+                logger.debug(f"  '{name}': mtime matches manifest but not in memory — forcing re-extraction.")
 
             # Folder is new or modified — collect image files and do full check
             image_files = [
@@ -201,7 +239,7 @@ class FaceDatabase:
             current_sig = self._folder_signature(image_files)
             current_sig["__folder_mtime__"] = folder_mtime
             # Preserve existing ID or assign a new one for this identity
-            existing_id = manifest.get(name, {}).get("__id__") or str(uuid.uuid4())
+            existing_id = self._id_for_name(name, manifest)
             current_sig["__id__"] = existing_id
             new_manifest[name] = current_sig
 
@@ -240,7 +278,10 @@ class FaceDatabase:
 
         # --- Step 3: remove identities whose folders were deleted --------
         removed = 0
-        stale = set(manifest.keys()) - gallery_names
+        # Gallery is the single source of truth. Any identity (whether it came from
+        # the manifest or was added via API and lives only in cache) that has no
+        # corresponding gallery folder is evicted on startup.
+        stale = (set(manifest.keys()) | set(self._identities.keys())) - gallery_names
         for name in stale:
             if name in self._identities:
                 self.delete_identity(name)
@@ -249,11 +290,13 @@ class FaceDatabase:
 
         # --- Summary -----------------------------------------------------
         total = len(self._identities)
-        changed = loaded + merged + removed
+        changed = loaded + merged + removed + id_repaired
         if merged:
             logger.info(f"Deduplication: {merged} folder(s) merged into existing identities.")
         if removed:
             logger.info(f"Removed {removed} stale identit(ies) not in gallery.")
+        if id_repaired:
+            logger.info(f"Repaired {id_repaired} manifest id mapping(s).")
         logger.info(f"Gallery ready: {total} unique identit(ies) in memory.")
 
         # Only write to disk if something actually changed
@@ -368,6 +411,14 @@ class FaceDatabase:
                 {"id": d["id"], "name": n, "embedding_count": d["count"]}
                 for n, d in self._identities.items()
             ]
+
+    def get_identity_id(self, name: str) -> str | None:
+        """Return an identity UUID by name, or None if not found."""
+        with self._lock:
+            data = self._identities.get(name)
+            if not data:
+                return None
+            return data.get("id")
 
     # ------------------------------------------------------------------
     # Cache persistence  (single .npz — fast bulk load ~1.5s for 1300 identities)

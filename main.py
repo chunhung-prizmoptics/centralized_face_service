@@ -156,6 +156,7 @@ def main():
                 model_lock=model_lock,
                 host=args.api_host,
                 port=args.api_port,
+                gallery_dir=args.gallery,
             )
         except Exception as exc:
             logger.error(f"Failed to start enrollment API ({exc}). Continuing without API.")
