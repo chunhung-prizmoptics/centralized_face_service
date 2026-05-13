@@ -6,6 +6,7 @@ InsightFace + ReID GPU inference, then publishes results back to Redis.
 """
 
 import json
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -442,18 +443,30 @@ class BatchWorker(threading.Thread):
         Compute all image-quality metrics in one pass over the decoded image.
 
         Returns a dict with:
-          sharpness  – Laplacian variance normalised to [0, 1] (saturates at 500)
+          sharpness  – Tenengrad energy (Sobel x² + y²) normalised to [0, 1] via
+                       log-scale, area-adjusted to a 112×112 reference crop.
+                       More discriminative than Laplacian variance; does not
+                       saturate on sharp faces and is less sensitive to skin texture.
           brightness – mean pixel intensity normalised to [0, 1]
           dark_ratio – fraction of pixels with intensity < 40  (0 = no dark pixels)
           face_size  – min width or height of the image in pixels
           quality    – alias for sharpness (kept for backward compat)
+
+        Tenengrad saturation reference (LOG_TENENGRAD_REF) was calibrated on
+        sharp 112×112 face crops; adjust if your typical crop size differs.
         """
+        # Normalise Tenengrad energy to a 112×112 reference area so that
+        # the score is independent of crop resolution.
+        _LOG_TENENGRAD_REF = math.log1p(1500.0)  # calibrated for 112×112 sharp faces
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        lap_var    = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        sharpness  = round(min(lap_var / 500.0, 1.0), 4)
+        h, w = gray.shape[:2]
+        area_scale = (112 * 112) / max(h * w, 1)
+        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        tenengrad = float((gx ** 2 + gy ** 2).mean()) * area_scale
+        sharpness  = round(min(math.log1p(tenengrad) / _LOG_TENENGRAD_REF, 1.0), 4)
         brightness = round(float(gray.mean()) / 255.0, 4)
         dark_ratio = round(float((gray < 40).sum()) / gray.size, 4)
-        h, w       = img.shape[:2]
         face_size  = min(w, h)
         return {
             "sharpness":  sharpness,
@@ -809,7 +822,7 @@ class BatchWorker(threading.Thread):
             b"track_id":          fields.get(b"track_id",   b""),
             b"timestamp":         fields.get(b"timestamp",  b""),
             b"identity":          identity.encode(),
-            b"identity_id":       identity.encode(),   # DEBUG: name instead of UUID for easy tracing
+            b"identity_id":       identity_id.encode(),   # DEBUG: name instead of UUID for easy tracing
             b"confidence":        str(round(float(confidence), 6)).encode(),
             b"yaw":               str(round(yaw,   2)).encode(),
             b"pitch":             str(round(pitch, 2)).encode(),
@@ -898,7 +911,7 @@ class BatchWorker(threading.Thread):
             b"track_id":          fields.get(b"track_id",   b""),
             b"timestamp":         fields.get(b"timestamp",  b""),
             b"identity":          cached["identity"].encode(),
-            b"identity_id":       cached["identity"].encode(),
+            b"identity_id":       cached["identity_id"].encode(),
             b"confidence":        str(round(float(cached["confidence"]), 6)).encode(),
             b"yaw":               str(round(cached["yaw"],   2)).encode(),
             b"pitch":             str(round(cached["pitch"], 2)).encode(),
