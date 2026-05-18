@@ -1,0 +1,49 @@
+services:
+  face-recognition:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: face-recognition-service:latest
+    container_name: face-recognition
+    restart: unless-stopped
+
+    # GPU access (requires nvidia-container-toolkit on the host)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    ports:
+      - "8000:8000"       # Enrollment API
+
+    environment:
+      REDIS_URL:                    redis://redis:6379
+      GALLERY_DIR:                  /data/gallery
+      CACHE_PATH:                   /data/face_db_cache.npz
+      WORKERS:                      "2"
+      BATCH_SIZE:                   "16"
+      MATCH_THRESHOLD:              "0.40"
+      GPU_ID:                       "0"
+      NO_REID:                      "1"
+      API_ENABLED:                  "1"
+      API_HOST:                     "0.0.0.0"
+      API_PORT:                     "8000"
+      TRACK_CACHE_TTL:              "30"
+      TRACK_CACHE_RECHECK:          "10"
+      TRACK_CACHE_UNKNOWN_RECHECK:  "3"
+      FACE_CROP_TTL:                "60"
+      # INSTANCE_ID: "node1"        # uncomment for multi-host deployments
+
+    volumes:
+      # Single mutable data directory: gallery + cache + manifest
+      - ./data:/data
+
+    networks:
+      - face-net
+
+networks:
+  face-net:
+    driver: bridge

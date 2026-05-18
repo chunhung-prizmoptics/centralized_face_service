@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Model cache (re-downloaded or volume-mounted)
+# Uncomment to exclude if you pre-bake models into the image:
+# .insightface/
+
+# Runtime data — always volume-mounted, never baked in
+data/
+face_db_cache.npz
+face_db_cache.manifest.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Test artefacts
+tests/pose_audit/
+temp.jpg
